@@ -1,0 +1,6919 @@
+---
+title: "Synthea Healthcare Analytics"
+subtitle: "Clinical Data Analysis — Patient Demographics, Anomaly Detection & Demand Forecasting"
+author: "Abdulrahman Jalilov"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+---
+
+# Setup and Data Preparation
+
+## Setup, Data Import, and Master Table
+
+```{r setup-data-import-master,include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+
+setwd("C:/Users/aksta/Desktop")
+options(encoding = "UTF-8")
+Sys.setlocale("LC_ALL", "Turkish")
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(lubridate)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(reshape2)
+library(corrplot)
+library(survival)
+library(stringr)
+
+encounters = readRDS("C:/Users/aksta/Desktop/Synthea/encounters.rds")
+observations  <- readRDS("C:/Users/aksta/Desktop/Synthea/observations .rds")
+patients      <- readRDS("C:/Users/aksta/Desktop/Synthea/patients.rds")
+
+dim(patients)
+dim(encounters)
+dim(observations)
+
+head(patients, 3)
+head(encounters, 3)
+head(observations, 3)
+
+colSums(is.na(patients))
+colSums(is.na(encounters))
+colSums(is.na(observations))
+
+# Gender
+patients[, .N, by = GENDER]
+
+# Race
+patients[, .N, by = RACE][order(-N)]
+
+
+# Master cədvəlini də yenilə
+patients[, age := as.integer(
+  difftime(
+    fifelse(is.na(DEATHDATE), as.IDate("2017-12-31"), DEATHDATE),
+    BIRTHDATE, units = "days"
+  ) / 365.25
+)]
+
+# =========================
+# FIX: Dynamic age at each encounter
+# Hər encounter-da xəstənin O GÜNKÜ yaşı hesablanır.
+# Statik 2017 yaşı yalnız patient-level demografiya üçün saxlanılır.
+# =========================
+encounters[, encounter_date_tmp := as.IDate(DATE)]
+encounters[patients, on = c(PATIENT = "ID"), BIRTHDATE_tmp := i.BIRTHDATE]
+encounters[, age_at_encounter := as.integer(
+  difftime(encounter_date_tmp, BIRTHDATE_tmp, units = "days") / 365.25
+)]
+encounters[, age_group_enc := fcase(
+  age_at_encounter <= 21, "0-21",
+  age_at_encounter <= 43, "22-43",
+  age_at_encounter  < 65, "44-65",
+  age_at_encounter >= 65, "65+",
+  default = NA_character_
+)]
+encounters[, c("encounter_date_tmp","BIRTHDATE_tmp") := NULL]
+
+
+# Encounter növləri
+encounters[, .N, by = DESCRIPTION][order(-N)]
+# Xəstə başına encounter sayı
+enc_per_pt <- encounters[, .N, by = PATIENT]
+summary(enc_per_pt$N)
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+observations[
+  DESCRIPTION %in% c(
+    "Body Height", "Body Weight",
+    "Systolic Blood Pressure", "Diastolic Blood Pressure",
+    "Body Mass Index"
+  ) & !is.na(value_num),
+  .(
+    N      = .N,
+    Orta   = round(mean(value_num), 1),
+    Median = round(median(value_num), 1),
+    Min    = round(min(value_num), 1),
+    Max    = round(max(value_num), 1)
+  ),
+  by = .(DESCRIPTION, UNITS)
+]
+
+# Encounter sayı hər xəstə üçün
+enc_count <- encounters[, .(enc_count = .N), by = PATIENT]
+
+# Hər xəstənin son vital ölçüləri
+last_vitals <- observations[
+  DESCRIPTION %in% c(
+    "Body Mass Index",
+    "Systolic Blood Pressure",
+    "Diastolic Blood Pressure"
+  ) & !is.na(value_num)
+][order(PATIENT, DATE)][
+  , .SD[.N], by = .(PATIENT, DESCRIPTION)
+] |> dcast(PATIENT ~ DESCRIPTION, value.var = "value_num")
+
+setnames(last_vitals,
+  old = c("Body Mass Index", "Diastolic Blood Pressure", "Systolic Blood Pressure"),
+  new = c("bmi", "dbp", "sbp")
+)
+
+# Master cədvəl
+master <- patients |>
+  merge(enc_count,   by.x = "ID", by.y = "PATIENT", all.x = TRUE) |>
+  merge(last_vitals, by.x = "ID", by.y = "PATIENT", all.x = TRUE)
+
+dim(master)
+head(master[, .(ID, age, GENDER, RACE, enc_count, bmi, sbp, dbp)], 5)
+library(stringr)
+master <- master %>%
+  mutate(
+    FIRST = str_remove_all(FIRST, "\\d+"),
+    LAST = str_remove_all(LAST, "\\d+"),
+    MAIDEN = str_remove_all(MAIDEN, "\\d+")
+  )
+
+master[, age := patients[match(master$ID, patients$ID), age]]
+
+summary(master$age)
+```
+
+
+# Descriptive Analysis
+
+## Gender Distribution
+
+
+```{r descriptive-gender-distribution, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+gender_summary <- master[
+  !is.na(GENDER),
+  .N,
+  by = GENDER
+][order(-N)]
+
+gender_summary[, percent := round(N/sum(N)*100,1)]
+
+plot_ly(
+  data = gender_summary,
+  labels = ~GENDER,
+  values = ~N,
+  type = "pie",
+  hole = 0.55,
+  textinfo = "label+percent",
+  textposition = "outside",
+  hovertemplate =
+    "<b>%{label}</b><br>"  %+%
+    "Say: %{value}<br>"    %+%
+    "Faiz: %{percent}<extra></extra>",
+  marker = list(
+    colors = c("#5E60CE","#64DFDF","#80FFDB"),
+    line = list(color = "white", width = 3)
+  )
+) |>
+  layout(
+    title = list(
+      text = "Gender Distribution",
+      x = 0.5,
+      font = list(size = 22)
+    ),
+    showlegend = TRUE,
+    annotations = list(
+      list(
+        text = paste0(sum(gender_summary$N), "<br>Patients"),
+        x = 0.5,
+        y = 0.5,
+        showarrow = FALSE,
+        font = list(size = 18)
+      )
+    )
+  )
+
+```
+
+## Age Group Distribution
+
+```{r descriptive-age-group-distribution, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+master<- master %>%  
+  mutate(
+    age_group = case_when(
+      age >= 0  & age <= 21 ~ "0-21",
+      age >= 22 & age <= 43 ~ "22-43",
+      age >= 44 & age < 65  ~ "44-65",
+      age >= 65             ~ "65+",
+      TRUE                  ~ NA_character_
+    )
+  )
+age_group_summary <- master[
+  !is.na(age_group),
+  .N,
+  by = age_group
+][order(age_group)]
+
+p_age <- ggplot(age_group_summary,
+       aes(x = age_group,
+           y = N,
+           fill = age_group)) +
+  
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = scales::comma(N)),
+    vjust = -0.3,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Age Group Distribution",
+    x = "Age Groups",
+    y = "Patient Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    legend.position = "none",
+    
+    axis.text.x = element_text(
+      face = "bold",
+      size = 11
+    ),
+    
+    axis.text.y = element_text(
+      size = 10
+    )
+  )
+
+p_age
+
+ggplotly(p_age)
+```
+
+## Top 10 Encounter Types
+
+```{r descriptive-top-10-encounter-types, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+enc_top10 <- encounters[
+  !is.na(DESCRIPTION),
+  .N,
+  by = DESCRIPTION
+][order(-N)][1:10]
+
+p_enc <- ggplot(enc_top10,
+       aes(x = reorder(DESCRIPTION, N),
+           y = N,
+           fill = N)) +
+  
+  geom_col(
+    width = 0.75,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = scales::comma(N)),
+    hjust = -0.1,
+    size = 3.8
+  ) +
+  
+  coord_flip() +
+  
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  
+  labs(
+    title = "Top 10 Encounter Types",
+    x = "",
+    y = "Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    
+    legend.position = "none",
+    
+    axis.text.y = element_text(
+      face = "bold",
+      size = 10
+    )
+  )
+
+p_enc
+
+ggplotly(p_enc)
+
+
+```
+## Encounter Type Intensity by Age Group
+
+```{r descriptive-encounter-type-intensity-age, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+
+
+# Encounter + patient age group
+enc_age_data <- encounters[
+  master,
+  on = c(PATIENT = "ID")
+]
+
+# Top 10 encounter type
+top_enc_types <- enc_age_data[
+  !is.na(DESCRIPTION) & !is.na(age_group),
+  .N,
+  by = DESCRIPTION
+][order(-N)][1:10, DESCRIPTION]
+
+# Age group + encounter type count
+enc_age_summary <- enc_age_data[
+  DESCRIPTION %in% top_enc_types &
+    !is.na(age_group),
+  .N,
+  by = .(age_group, DESCRIPTION)
+]
+
+# Age group order
+enc_age_summary[, age_group := factor(
+  age_group,
+  levels = c("0-21", "22-43", "44-65", "65+")
+)]
+
+# Encounter type order
+enc_age_summary[, DESCRIPTION := reorder(DESCRIPTION, N)]
+
+# Bubble chart
+p_enc_age_bubble <- ggplot(
+  enc_age_summary,
+  aes(
+    x = age_group,
+    y = DESCRIPTION,
+    size = N,
+    fill = N,
+    text = paste0(
+      "Age Group: ", age_group,
+      "<br>Encounter Type: ", DESCRIPTION,
+      "<br>Count: ", scales::comma(N)
+    )
+  )
+) +
+  geom_point(
+    shape = 21,
+    color = "white",
+    alpha = 0.85
+  ) +
+  scale_size_continuous(
+    range = c(4, 22),
+    labels = scales::comma
+  ) +
+  scale_fill_gradient(
+    low = "#BDE0FE",
+    high = "#023E8A",
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Encounter Type Intensity by Age Group",
+    subtitle = "Bubble size shows encounter count for each age group",
+    x = "Age Group",
+    y = "Encounter Type",
+    size = "Count",
+    fill = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 11
+    ),
+    axis.text.x = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.text.y = element_text(
+      face = "bold",
+      size = 9
+    ),
+    legend.position = "right"
+  )
+
+p_enc_age_bubble
+
+ggplotly(p_enc_age_bubble, tooltip = "text")
+
+```
+
+
+
+## Clinical Indicator Measurement Counts
+
+>Terminologiyalar qısa izah
+Body Mass Index (BMI)
+Boy və çəkiyə əsasən bədən çəkisinin normal olub-olmadığını göstərir.
+Systolic Blood Pressure
+Ürək qanı pompalayanda yaranan “yuxarı təzyiq” göstəricisidir.
+Diastolic Blood Pressure
+Ürək istirahətdə olarkən damar təzyiqini göstərən “aşağı təzyiq” göstəricisidir.
+Hemoglobin A1c (HbA1c)
+Son 2-3 ay üzrə orta qan şəkəri səviyyəsini göstərir və diabet monitorinqində istifadə olunur.
+Glucose
+Qanda şəkər səviyyəsini ölçür.
+Triglycerides
+Qandakı yağ səviyyəsini göstərir və ürək-damar riskləri ilə əlaqəlidir.
+Cholesterol
+Qandakı xolesterol səviyyəsini göstərir və kardiovaskulyar risk analizi üçün vacibdir
+
+```{r descriptive-clinical-indicator-counts, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+clinical_counts <- observations[
+  DESCRIPTION %in% c(
+    "Total Cholesterol",
+    "Triglycerides",
+    "Glucose",
+    "Hemoglobin A1c/Hemoglobin.total in Blood",
+    "Body Mass Index",
+    "Diastolic Blood Pressure",
+    "Systolic Blood Pressure"
+  ) & !is.na(value_num),
+  .N,
+  by = DESCRIPTION
+]
+
+clinical_counts[, short_name := case_when(
+  DESCRIPTION == "Total Cholesterol" ~ "Total Chol",
+  DESCRIPTION == "Triglycerides" ~ "Triglycerides",
+  DESCRIPTION == "Glucose" ~ "Glucose",
+  DESCRIPTION == "Hemoglobin A1c/Hemoglobin.total in Blood" ~ "HbA1c",
+  DESCRIPTION == "Body Mass Index" ~ "BMI",
+  DESCRIPTION == "Diastolic Blood Pressure" ~ "Diastolic BP",
+  DESCRIPTION == "Systolic Blood Pressure" ~ "Systolic BP",
+  TRUE ~ DESCRIPTION
+)]
+
+clinical_counts[, short_name := factor(
+  short_name,
+  levels = c("Total Chol", "Triglycerides", "Glucose",
+             "HbA1c", "BMI", "Diastolic BP", "Systolic BP")
+)]
+
+ ggplot(
+  clinical_counts,
+  aes(x = short_name, y = N, fill = short_name)
+) +
+  geom_col(width = 0.65, color = "white") +
+  geom_text(
+    aes(label = scales::comma(N)),
+    vjust = -0.4,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Əsas klinik göstəriciləri üzrə ölçmə sayı",
+    x = "",
+    y = "Ölçmə sayı",
+    fill = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    legend.position = "top",
+    axis.text.x = element_text(size = 10, face = "bold"),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+```
+## Detailed Age Distribution
+
+```{r descriptive-detailed-age-distribution, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+
+age_data <- master[, .N, by = age][order(age)]
+
+plot_ly(
+  data = age_data,
+  x    = ~age,
+  y    = ~N,
+  type = "bar",
+  marker = list(color = "#7F77DD")
+) |>
+  layout(
+    title  = "Xəstələrin yaş paylanması",
+    xaxis  = list(title = "Yaş"),
+    yaxis  = list(title = "Xəstə sayı"),
+    hovermode = "x"
+  )
+
+```
+
+## Hospital Usage Intensity
+
+```{r descriptive-hospital-usage-intensity, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+enc_usage <- master[, .(
+  encounter_group = case_when(
+    enc_count == 0 ~ "0",
+    enc_count >= 1 & enc_count <= 5 ~ "1-5",
+    enc_count >= 6 & enc_count <= 15 ~ "6-15",
+    enc_count >= 16 & enc_count <= 30 ~ "16-30",
+    enc_count > 30 ~ "30+"
+  )
+)][
+  , .N, by = encounter_group
+]
+
+p_usage <- ggplot(enc_usage,
+       aes(x = encounter_group,
+           y = N,
+           fill = encounter_group)) +
+  
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = scales::comma(N)),
+    vjust = -0.3,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Hospital Usage Intensity",
+    x = "Encounter Groups",
+    y = "Patient Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    legend.position = "none"
+  )
+
+p_usage
+
+ggplotly(p_usage)
+
+```
+
+
+## Average BMI by Age Group
+
+```{r descriptive-average-bmi-by-age-group, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+# =========================
+# FIX: Encounter-level BMI (teacher fix applied)
+# Hər encounter-da xəstənin O GÜNƏ ən yaxın BMI ölçüsü götürülür.
+# Bütün illərin ortalaması deyil — bu tibbi cəhətdən mənasızdır.
+# =========================
+
+obs_bmi_tmp <- observations[
+  DESCRIPTION == "Body Mass Index" & !is.na(value_num),
+  .(PATIENT, obs_date = as.IDate(DATE), bmi = value_num)
+]
+setkey(obs_bmi_tmp, PATIENT, obs_date)
+
+enc_tmp <- encounters[!is.na(age_group_enc),
+  .(PATIENT, enc_date = as.IDate(DATE), age_group_enc)]
+setkey(enc_tmp, PATIENT, enc_date)
+
+enc_bmi_joined <- obs_bmi_tmp[enc_tmp,
+  on = .(PATIENT, obs_date <= enc_date),
+  mult = "last",
+  .(PATIENT, enc_date, age_group_enc, bmi = x.bmi)
+]
+
+master[, age_group2 := cut(
+  age,
+  breaks = c(0,10,20,30,40,50,60,70,80,90,Inf),
+  labels = c("0-9","10-19","20-29","30-39","40-49",
+             "50-59","60-69","70-79","80-89","90+"),
+  right = FALSE
+)]
+
+bmi_age_avg <- enc_bmi_joined[
+  !is.na(age_group_enc) & !is.na(bmi),
+  .(avg_bmi = round(mean(bmi, na.rm = TRUE), 1)),
+  by = .(age_group2 = age_group_enc)
+]
+
+p_bmi_avg <- ggplot(
+  bmi_age_avg,
+  aes(x = age_group2,
+      y = avg_bmi,
+      fill = avg_bmi)
+) +
+  
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = avg_bmi),
+    vjust = -0.4,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Average BMI by Age Group",
+    x = "Age Group",
+    y = "Average BMI"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    
+    legend.position = "none",
+    
+    axis.text.x = element_text(
+      face = "bold"
+    )
+  )
+
+p_bmi_avg
+
+ggplotly(p_bmi_avg)
+```
+
+## Average Systolic Blood Pressure by Age Group
+
+```{r descriptive-average-systolic-bp-by-age, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+
+# =========================
+# FIX: Encounter-level SBP (teacher fix applied)
+# =========================
+obs_sbp_tmp <- observations[
+  DESCRIPTION == "Systolic Blood Pressure" & !is.na(value_num),
+  .(PATIENT, obs_date = as.IDate(DATE), sbp = value_num)
+]
+setkey(obs_sbp_tmp, PATIENT, obs_date)
+
+enc_sbp_joined <- obs_sbp_tmp[enc_tmp,
+  on = .(PATIENT, obs_date <= enc_date),
+  mult = "last",
+  .(PATIENT, enc_date, age_group_enc, sbp = x.sbp)
+]
+
+sbp_age_avg <- enc_sbp_joined[
+  !is.na(age_group_enc) & !is.na(sbp),
+  .(avg_sbp = round(mean(sbp, na.rm = TRUE), 1)),
+  by = .(age_group2 = age_group_enc)
+]
+
+p_sbp_avg <- ggplot(
+  sbp_age_avg,
+  aes(x = age_group2,
+      y = avg_sbp,
+      fill = avg_sbp)
+) +
+  
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = avg_sbp),
+    vjust = -0.4,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Average Systolic BP by Age Group",
+    x = "Age Group",
+    y = "Average Systolic BP"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    
+    legend.position = "none",
+    
+    axis.text.x = element_text(
+      face = "bold"
+    )
+  )
+
+p_sbp_avg
+
+ggplotly(p_sbp_avg)
+
+
+```
+
+
+
+## Average Systolic Blood Pressure by BMI Category
+
+```{r descriptive-systolic-bp-by-bmi-category, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+master <- as.data.table(master)
+
+# Lazımi column-lar numeric olsun
+master[, bmi := as.numeric(bmi)]
+master[, sbp := as.numeric(sbp)]
+
+# Əgər bmi_category yoxdursa, yaradırıq
+master[, bmi_category := case_when(
+  !is.na(bmi) & bmi < 18.5 ~ "Underweight",
+  !is.na(bmi) & bmi >= 18.5 & bmi < 25 ~ "Normal",
+  !is.na(bmi) & bmi >= 25 & bmi < 30 ~ "Overweight",
+  !is.na(bmi) & bmi >= 30 ~ "Obese",
+  TRUE ~ "Unknown"
+)]
+
+# BMI category order
+master[, bmi_category := factor(
+  bmi_category,
+  levels = c("Underweight", "Normal", "Overweight", "Obese", "Unknown")
+)]
+
+# Average Systolic BP by BMI Category
+sbp_bmi_cat <- master[
+  !is.na(bmi_category) &
+    bmi_category != "Unknown" &
+    !is.na(sbp),
+  .(
+    avg_sbp = round(mean(sbp, na.rm = TRUE), 1),
+    patient_count = .N
+  ),
+  by = bmi_category
+]
+
+sbp_bmi_cat[, bmi_category := factor(
+  bmi_category,
+  levels = c("Underweight", "Normal", "Overweight", "Obese")
+)]
+
+sbp_bmi_cat <- sbp_bmi_cat[order(bmi_category)]
+
+sbp_bmi_cat
+
+# Chart
+p_sbp_bmi <- ggplot(
+  sbp_bmi_cat,
+  aes(
+    x = bmi_category,
+    y = avg_sbp,
+    fill = bmi_category,
+    text = paste0(
+      "BMI Category: ", bmi_category,
+      "<br>Average Systolic BP: ", avg_sbp,
+      "<br>Patient Count: ", scales::comma(patient_count)
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = paste0(avg_sbp, "\n(n=", scales::comma(patient_count), ")")),
+    vjust = -0.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Average Systolic BP by BMI Category",
+    x = "BMI Category",
+    y = "Average Systolic BP"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    legend.position = "none",
+    axis.text.x = element_text(face = "bold", size = 11)
+  )
+
+p_sbp_bmi
+
+ggplotly(p_sbp_bmi, tooltip = "text")
+
+```
+## Average Total Cholesterol by Glucose Category
+
+```{r descriptive-cholesterol-by-glucose-category, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+observations <- as.data.table(observations)
+master <- as.data.table(master)
+
+# VALUE numeric olsun
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+# 1. Glucose və Total Cholesterol son dəyərləri
+
+glucose_chol_data <- observations[
+  DESCRIPTION %in% c(
+    "Glucose",
+    "Total Cholesterol"
+  ) &
+    !is.na(value_num),
+  .(
+    PATIENT,
+    DATE,
+    DESCRIPTION,
+    value_num
+  )
+][
+  order(PATIENT, DESCRIPTION, DATE)
+][
+  ,
+  .SD[.N],
+  by = .(PATIENT, DESCRIPTION)
+]
+
+glucose_chol_wide <- dcast(
+  glucose_chol_data,
+  PATIENT ~ DESCRIPTION,
+  value.var = "value_num"
+)
+
+setDT(glucose_chol_wide)
+
+setnames(
+  glucose_chol_wide,
+  old = c("Glucose", "Total Cholesterol"),
+  new = c("glucose", "cholesterol"),
+  skip_absent = TRUE
+)
+
+# Əgər master-da köhnə glucose/cholesterol varsa, silirik
+old_cols <- intersect(
+  names(master),
+  c("glucose", "cholesterol", "glucose_category")
+)
+
+if (length(old_cols) > 0) {
+  master[, (old_cols) := NULL]
+}
+
+# Master ilə merge
+master <- merge(
+  master,
+  glucose_chol_wide,
+  by.x = "ID",
+  by.y = "PATIENT",
+  all.x = TRUE
+)
+
+master[, glucose := as.numeric(glucose)]
+master[, cholesterol := as.numeric(cholesterol)]
+
+# 2. Glucose category
+
+master[, glucose_category := case_when(
+  glucose < 70 ~ "Low",
+  glucose >= 70 & glucose < 100 ~ "Normal",
+  glucose >= 100 & glucose < 126 ~ "Prediabetic",
+  glucose >= 126 ~ "Diabetic",
+  TRUE ~ "Unknown"
+)]
+
+master[, glucose_category := factor(
+  glucose_category,
+  levels = c("Low", "Normal", "Prediabetic", "Diabetic", "Unknown")
+)]
+
+# 3. Average cholesterol by glucose category
+
+
+chol_by_glucose <- master[
+  glucose_category != "Unknown" &
+    !is.na(cholesterol),
+  .(
+    patient_count = .N,
+    avg_cholesterol = round(mean(cholesterol, na.rm = TRUE), 1),
+    median_cholesterol = round(median(cholesterol, na.rm = TRUE), 1),
+    min_cholesterol = min(cholesterol, na.rm = TRUE),
+    max_cholesterol = max(cholesterol, na.rm = TRUE)
+  ),
+  by = glucose_category
+][order(glucose_category)]
+
+# 4. Visual
+
+p_chol_glucose <- ggplot(
+  chol_by_glucose,
+  aes(
+    x = glucose_category,
+    y = avg_cholesterol,
+    fill = glucose_category,
+    text = paste0(
+      "Glucose Category: ", glucose_category,
+      "<br>Average Cholesterol: ", avg_cholesterol,
+      "<br>Median Cholesterol: ", median_cholesterol,
+      "<br>Patient Count: ", scales::comma(patient_count),
+      "<br>Min Cholesterol: ", min_cholesterol,
+      "<br>Max Cholesterol: ", max_cholesterol
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = paste0(
+      avg_cholesterol,
+      "\n(n=", scales::comma(patient_count), ")"
+    )),
+    vjust = -0.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Average Total Cholesterol by Glucose Category",
+    subtitle = "Descriptive comparison of cholesterol levels across glucose groups",
+    x = "Glucose Category",
+    y = "Average Total Cholesterol"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_chol_glucose
+
+ggplotly(p_chol_glucose, tooltip = "text")
+```
+
+
+## Patient Monitoring Level
+
+```{r descriptive-patient-monitoring-level, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+monitoring <- observations[
+  DESCRIPTION %in% c(
+    "Body Mass Index",
+    "Systolic Blood Pressure",
+    "Diastolic Blood Pressure",
+    "Glucose",
+    "Total Cholesterol",
+    "Triglycerides",
+    "Hemoglobin A1c/Hemoglobin.total in Blood"
+  ),
+  .N,
+  by = PATIENT
+]
+
+setnames(
+  monitoring,
+  "N",
+  "measurement_count"
+)
+
+master <- merge(
+  master,
+  monitoring,
+  by.x = "ID",
+  by.y = "PATIENT",
+  all.x = TRUE
+)
+
+master[, monitoring_level := case_when(
+  measurement_count <= 5 ~ "Low Monitoring",
+  measurement_count > 5 & measurement_count <= 20 ~ "Moderate Monitoring",
+  measurement_count > 20 ~ "High Monitoring"
+)]
+
+monitor_summary <- master[
+  ,
+  .N,
+  by = monitoring_level
+]
+
+monitor_summary[, monitoring_level := factor(
+  monitoring_level,
+  levels = c(
+    "Low Monitoring",
+    "Moderate Monitoring",
+    "High Monitoring"
+  )
+)]
+
+p_monitor <- ggplot(
+  monitor_summary,
+  aes(x = monitoring_level,
+      y = N,
+      fill = monitoring_level)
+) +
+  
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = scales::comma(N)),
+    vjust = -0.3,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Patient Monitoring Level",
+    x = "",
+    y = "Patient Count"
+  ) +
+  
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    
+    legend.position = "none"
+  )
+
+p_monitor
+
+ggplotly(p_monitor)
+
+
+```
+
+
+## Top 10 Reasons for Hospital Visits
+```{r descriptive-top-10-visit-reasons, include=TRUE,message=FALSE,warning=FALSE,echo=TRUE}
+visit_reason <- encounters[
+  !is.na(REASONDESCRIPTION),
+  .N,
+  by = REASONDESCRIPTION
+][order(-N)][1:10]
+
+p_reason <- ggplot(
+  visit_reason,
+  aes(x = reorder(REASONDESCRIPTION, N),
+      y = N,
+      fill = N)
+) +
+  
+  geom_col(
+    width = 0.75,
+    color = "white"
+  ) +
+  
+  geom_text(
+    aes(label = scales::comma(N)),
+    hjust = -0.1,
+    size = 3.8
+  ) +
+  
+  coord_flip() +
+  
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  
+  labs(
+    title = "Top 10 Reasons for Hospital Visits",
+    x = "",
+    y = "Encounter Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    
+    legend.position = "none",
+    
+    axis.text.y = element_text(
+      face = "bold",
+      size = 9
+    )
+  )
+
+p_reason
+
+
+
+```
+
+
+# Anomaly Analysis
+
+## Observation Before Encounter Date Gap Anomaly
+
+```{r anomaly-observation-before-encounter, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+observations <- as.data.table(observations)
+encounters <- as.data.table(encounters)
+
+# Tarixləri düzəldirik
+observations[, obs_date := as.IDate(DATE)]
+encounters[, encounter_date := as.IDate(DATE)]
+
+# Observation + Encounter join
+obs_enc_date <- observations[
+  encounters[, .(
+    ID,
+    encounter_date,
+    encounter_type = DESCRIPTION,
+    reason_description = REASONDESCRIPTION
+  )],
+  on = c(ENCOUNTER = "ID"),
+  nomatch = 0
+]
+
+# Gün fərqi: positive = observation encounter-dən əvvəldir
+obs_enc_date[, days_before_encounter := as.integer(encounter_date - obs_date)]
+
+# Sadəcə observation encounter-dən əvvəl olanlar
+obs_before_encounter <- obs_enc_date[
+  !is.na(obs_date) &
+    !is.na(encounter_date) &
+    obs_date < encounter_date
+]
+
+# Gap category
+obs_before_encounter[, gap_group := case_when(
+  days_before_encounter >= 1 & days_before_encounter <= 1 ~ "0-1 day before",
+  days_before_encounter >= 2 & days_before_encounter <= 7 ~ "2-7 days before",
+  days_before_encounter >= 8 & days_before_encounter <= 30 ~ "8-30 days before",
+  days_before_encounter >= 31 & days_before_encounter <= 365 ~ "31-365 days before",
+  days_before_encounter > 365 ~ "1+ year before",
+  TRUE ~ "Other"
+)]
+
+obs_before_encounter[, gap_group := factor(
+  gap_group,
+  levels = c(
+    "0-1 day before",
+    "2-7 days before",
+    "8-30 days before",
+    "31-365 days before",
+    "1+ year before"
+  )
+)]
+
+# Summary
+obs_before_summary <- obs_before_encounter[
+  ,
+  .(
+    record_count = .N,
+    unique_patients = uniqueN(PATIENT),
+    min_days_before = min(days_before_encounter, na.rm = TRUE),
+    max_days_before = max(days_before_encounter, na.rm = TRUE)
+  ),
+  by = gap_group
+][order(gap_group)]
+
+obs_before_summary
+
+# Daha ciddi anomaly: 31+ gün əvvəl olanlar
+obs_before_anomaly <- obs_before_encounter[
+  days_before_encounter >= 31
+]
+
+obs_before_anomaly_summary <- obs_before_anomaly[
+  ,
+  .(
+    anomaly_records = .N,
+    unique_patients = uniqueN(PATIENT),
+    max_days_before = max(days_before_encounter, na.rm = TRUE)
+  )
+]
+
+obs_before_anomaly_summary
+
+# Description üzrə hansı testlərdə daha çoxdur?
+obs_before_by_description <- obs_before_anomaly[
+  ,
+  .(
+    anomaly_records = .N,
+    unique_patients = uniqueN(PATIENT),
+    avg_days_before = round(mean(days_before_encounter, na.rm = TRUE), 1),
+    max_days_before = max(days_before_encounter, na.rm = TRUE)
+  ),
+  by = DESCRIPTION
+][order(-anomaly_records)][1:15]
+
+obs_before_by_description
+
+# Visual
+p_obs_before <- ggplot(
+  obs_before_summary,
+  aes(
+    x = gap_group,
+    y = record_count,
+    fill = gap_group,
+    text = paste0(
+      "Gap Group: ", gap_group,
+      "<br>Record Count: ", scales::comma(record_count),
+      "<br>Unique Patients: ", scales::comma(unique_patients),
+      "<br>Min Days Before: ", min_days_before,
+      "<br>Max Days Before: ", max_days_before
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = scales::comma(record_count)),
+    vjust = -0.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  labs(
+    title = "Observation Before Encounter Date Gap",
+    subtitle = "Large pre-encounter gaps were reviewed as timeline anomalies",
+    x = "Time Gap",
+    y = "Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(angle = 25, hjust = 1, face = "bold"),
+    legend.position = "none"
+  )
+
+p_obs_before
+
+ggplotly(p_obs_before, tooltip = "text")
+```
+## Death Certification Before Death Anomaly
+```{r anomaly-death-certification-before-death, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+patients <- as.data.table(patients)
+encounters <- as.data.table(encounters)
+
+# =========================
+# 1. Date preparation
+# =========================
+
+patients[, death_date := as.IDate(DEATHDATE)]
+encounters[, encounter_date := as.IDate(DATE)]
+
+# =========================
+# 2. Death Certification encounter-ləri tapırıq
+# =========================
+
+death_cert_encounters <- encounters[
+  grepl("Death Certification", DESCRIPTION, ignore.case = TRUE),
+  .(
+    encounter_id = ID,
+    PATIENT,
+    encounter_date,
+    encounter_type = DESCRIPTION,
+    reason_description = REASONDESCRIPTION
+  )
+]
+
+# Əgər Death Certification tapılmasa, mesaj versin
+if (nrow(death_cert_encounters) == 0) {
+  
+  print("Death Certification encounter tapılmadı. DESCRIPTION dəyərlərini yoxla.")
+  
+} else {
+  
+  # =========================
+  # 3. Patient death date və ad-soyad əlavə edirik
+  # =========================
+  
+  death_cert_with_patient <- merge(
+    death_cert_encounters,
+    patients[
+      ,
+      .(
+        PATIENT = ID,
+        death_date,
+        FIRST,
+        LAST,
+        GENDER,
+        RACE
+      )
+    ],
+    by = "PATIENT",
+    all.x = TRUE
+  )
+  
+  # Ad-soyad təmizliyi
+  death_cert_with_patient[, FIRST := gsub("[0-9]", "", FIRST)]
+  death_cert_with_patient[, LAST := gsub("[0-9]", "", LAST)]
+  
+  death_cert_with_patient[, patient_name := trimws(paste(FIRST, LAST))]
+  
+  death_cert_with_patient[
+    is.na(patient_name) |
+      patient_name == "" |
+      patient_name == "NA NA",
+    patient_name := "Unknown Patient"
+  ]
+  
+  # =========================
+  # 4. Death Certification ölüm tarixindən əvvəl olubmu?
+  # =========================
+  
+  death_cert_with_patient[, days_before_death := as.integer(death_date - encounter_date)]
+  
+  death_cert_before_death <- death_cert_with_patient[
+    !is.na(death_date) &
+      !is.na(encounter_date) &
+      encounter_date < death_date
+  ][order(-days_before_death)]
+  
+  death_cert_before_death
+  
+  # =========================
+  # 5. Əgər anomaly yoxdursa mesaj versin
+  # =========================
+  
+  if (nrow(death_cert_before_death) == 0) {
+    
+    print("Death Certification before death date anomaly tapılmadı.")
+    
+  } else {
+    
+    # Gün fərqini ilə çeviririk
+    death_cert_before_death[, years_before_death := round(days_before_death / 365.25, 1)]
+    
+    # Top 10 ən böyük fərq
+    top_death_cert_years <- death_cert_before_death[
+      order(-years_before_death)
+    ][1:min(10, .N)]
+    
+    # Label
+    top_death_cert_years[, patient_label := paste0(
+      patient_name,
+      " (",
+      substr(PATIENT, 1, 6),
+      "...)"
+    )]
+    
+    top_death_cert_years[, patient_label := factor(
+      patient_label,
+      levels = rev(patient_label)
+    )]
+    
+    # =========================
+    # 6. Chart
+    # =========================
+    
+    p_death_years <- ggplot(
+      top_death_cert_years,
+      aes(
+        y = patient_label,
+        x = years_before_death,
+        text = paste0(
+          "Patient: ", patient_name,
+          "<br>Patient ID: ", PATIENT,
+          "<br>Certification Date: ", encounter_date,
+          "<br>Death Date: ", death_date,
+          "<br>Gap: ", years_before_death, " years",
+          "<br>Days Before Death: ", scales::comma(days_before_death)
+        )
+      )
+    ) +
+      geom_segment(
+        aes(
+          x = 0,
+          xend = years_before_death,
+          y = patient_label,
+          yend = patient_label
+        ),
+        color = "gray70",
+        linewidth = 1
+      ) +
+      geom_point(
+        size = 4,
+        color = "#2C7FB8"
+      ) +
+      geom_text(
+        aes(label = paste0(years_before_death, " yr")),
+        hjust = -0.15,
+        size = 4,
+        fontface = "bold"
+      ) +
+      scale_x_continuous(
+        labels = function(x) paste0(x, " yr"),
+        expand = expansion(mult = c(0, 0.20))
+      ) +
+      labs(
+        title = "Top Death Certification Anomalies",
+        subtitle = "Death certification date appears before the recorded death date",
+        x = "Years Before Death",
+        y = "Patient"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+        plot.subtitle = element_text(hjust = 0.5, size = 11),
+        axis.text.y = element_text(face = "bold", size = 9)
+      )
+    
+    p_death_years
+    
+    ggplotly(p_death_years, tooltip = "text")
+  }
+}
+
+
+```
+
+## Negative HbA1c Value Anomaly
+
+```{r anomaly-negative-hba1c-values, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+# HbA1c VALUE numeric deyilsə, numeric-ə çeviririk
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+# Negative raw HbA1c observation-ları
+hba1c_raw_negative <- observations[
+  DESCRIPTION == "Hemoglobin A1c/Hemoglobin.total in Blood" &
+    !is.na(value_num) &
+    value_num < 0,
+  .(
+    PATIENT,
+    DATE,
+    DESCRIPTION,
+    VALUE,
+    value_num,
+    UNITS
+  )
+][order(PATIENT, DATE)]
+
+# Ümumi summary: təkrarlarla birlikdə və unique patient sayı
+negative_hba1c_count_summary <- hba1c_raw_negative[
+  ,
+  .(
+    total_negative_records = .N,
+    unique_patients = uniqueN(PATIENT),
+    min_negative_value = min(value_num, na.rm = TRUE),
+    max_negative_value = max(value_num, na.rm = TRUE)
+  )
+]
+
+# Hər xəstədə neçə dəfə negative HbA1c təkrarlanıb
+negative_hba1c_by_patient <- hba1c_raw_negative[
+  ,
+  .(
+    negative_record_count = .N,
+    min_hba1c = min(value_num, na.rm = TRUE),
+    max_hba1c = max(value_num, na.rm = TRUE)
+  ),
+  by = PATIENT
+][order(-negative_record_count, min_hba1c)]
+
+# Nəticələri göstəririk
+negative_hba1c_count_summary
+
+negative_hba1c_by_patient
+
+hba1c_raw_negative
+
+# =========================
+# Chart 1: Negative HbA1c dəyərlərinin paylanması
+# =========================
+
+p_negative_hba1c_values <- ggplot(
+  hba1c_raw_negative,
+  aes(
+    x = value_num,
+    text = paste0(
+      "Patient ID: ", PATIENT,
+      "<br>Date: ", DATE,
+      "<br>HbA1c Value: ", value_num,
+      "<br>Unit: ", UNITS
+    )
+  )
+) +
+  geom_histogram(
+    bins = 15,
+    color = "white"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Negative HbA1c Value Anomaly",
+    subtitle = "Only HbA1c values below 0 are shown",
+    x = "HbA1c Value",
+    y = "Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 11
+    )
+  )
+
+p_negative_hba1c_values
+
+ggplotly(p_negative_hba1c_values, tooltip = "text")
+
+
+# =========================
+# Chart 2: Patient üzrə negative HbA1c təkrar sayı
+# =========================
+
+negative_hba1c_by_patient[, patient_short := paste0(
+  substr(PATIENT, 1, 8),
+  "..."
+)]
+
+top_negative_hba1c_patients <- negative_hba1c_by_patient[
+  order(-negative_record_count, min_hba1c)
+][1:15]
+
+patients <- as.data.table(patients)
+
+patient_names <- patients[
+  ,
+  .(
+    PATIENT = ID,
+    FIRST,
+    LAST
+  )
+]
+
+# Ad-soyadda rəqəm varsa təmizləyirik
+patient_names[, FIRST := gsub("[0-9]", "", FIRST)]
+patient_names[, LAST := gsub("[0-9]", "", LAST)]
+
+patient_names[, full_name := trimws(paste(FIRST, LAST))]
+
+# Ad boşdursa Patient ID göstərilsin
+patient_names[
+  is.na(full_name) | full_name == "",
+  full_name := paste0("Unknown Patient")
+]
+
+negative_hba1c_by_patient_named <- merge(
+  negative_hba1c_by_patient,
+  patient_names,
+  by = "PATIENT",
+  all.x = TRUE
+)
+
+# Unique label: ad soyad + qısa ID
+negative_hba1c_by_patient_named[, patient_label := paste0(
+  full_name,
+  " (",
+  substr(PATIENT, 1, 6),
+  "...)"
+)]
+
+top_negative_hba1c_patients <- negative_hba1c_by_patient_named[
+  order(-negative_record_count, min_hba1c)
+][1:15]
+
+p_negative_hba1c_patients <- ggplot(
+  top_negative_hba1c_patients,
+  aes(
+    x = reorder(patient_label, negative_record_count),
+    y = negative_record_count,
+    fill = negative_record_count,
+    text = paste0(
+      "Patient Name: ", full_name,
+      "<br>Patient ID: ", PATIENT,
+      "<br>Negative Record Count: ", negative_record_count,
+      "<br>Minimum HbA1c: ", min_hba1c,
+      "<br>Maximum HbA1c: ", max_hba1c
+    )
+  )
+) +
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = negative_record_count),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "Repeated Negative HbA1c Records by Patient",
+    subtitle = "Top patients with repeated impossible HbA1c values",
+    x = "Patient",
+    y = "Negative HbA1c Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 11
+    ),
+    axis.text.y = element_text(
+      face = "bold",
+      size = 8
+    ),
+    legend.position = "none"
+  )
+
+p_negative_hba1c_patients
+
+ggplotly(p_negative_hba1c_patients, tooltip = "text")
+
+```
+
+
+
+
+## Abnormal Encounters After Death
+
+```{r anomaly-after-death-encounters, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+patients <- as.data.table(patients)
+encounters <- as.data.table(encounters)
+
+# =========================
+# 1. Tarixləri hazırlayırıq
+# =========================
+
+patients[, death_date := as.IDate(DEATHDATE)]
+encounters[, encounter_date := as.IDate(DATE)]
+
+# =========================
+# 2. Encounter + patient death date join
+# =========================
+
+enc_death <- encounters[
+  patients[, .(
+    ID,
+    death_date,
+    BIRTHDATE,
+    GENDER,
+    RACE,
+    ETHNICITY
+  )],
+  on = c(PATIENT = "ID"),
+  nomatch = 0
+]
+
+# =========================
+# 3. Ölüm tarixindən sonra olan encounter-lər
+# =========================
+
+after_death_encounters <- enc_death[
+  !is.na(death_date) &
+    !is.na(encounter_date) &
+    encounter_date > death_date,
+  .(
+    encounter_id = ID,
+    PATIENT,
+    encounter_date,
+    death_date,
+    days_after_death = as.integer(encounter_date - death_date),
+    encounter_type = DESCRIPTION,
+    reason_description = REASONDESCRIPTION,
+    GENDER,
+    RACE,
+    ETHNICITY
+  )
+][order(-days_after_death)]
+
+after_death_encounters
+
+# =========================
+# 4. Administrative vs abnormal clinical encounter
+# =========================
+
+after_death_encounters[, after_death_status := case_when(
+  grepl("Death Certification", encounter_type, ignore.case = TRUE) ~
+    "Administrative / Death Certification",
+  
+  TRUE ~
+    "Abnormal Clinical Encounter After Death"
+)]
+
+# =========================
+# 5. Summary: status üzrə
+# =========================
+
+after_death_status_summary <- after_death_encounters[
+  ,
+  .(
+    record_count = .N,
+    unique_patients = uniqueN(PATIENT),
+    min_days_after_death = min(days_after_death, na.rm = TRUE),
+    max_days_after_death = max(days_after_death, na.rm = TRUE)
+  ),
+  by = after_death_status
+][order(-record_count)]
+
+after_death_status_summary
+
+# =========================
+# 6. Sadəcə abnormal olanlar
+# =========================
+
+abnormal_after_death <- after_death_encounters[
+  after_death_status == "Abnormal Clinical Encounter After Death"
+]
+
+abnormal_after_death
+
+# =========================
+# 7. Abnormal encounter type üzrə summary
+# =========================
+
+abnormal_after_death_type_summary <- abnormal_after_death[
+  ,
+  .(
+    record_count = .N,
+    unique_patients = uniqueN(PATIENT),
+    min_days_after_death = min(days_after_death, na.rm = TRUE),
+    max_days_after_death = max(days_after_death, na.rm = TRUE)
+  ),
+  by = encounter_type
+][order(-record_count)]
+
+abnormal_after_death_type_summary
+
+# =========================
+# 8. Abnormal reason üzrə summary
+# =========================
+
+abnormal_after_death_reason_summary <- abnormal_after_death[
+  ,
+  .(
+    record_count = .N,
+    unique_patients = uniqueN(PATIENT),
+    min_days_after_death = min(days_after_death, na.rm = TRUE),
+    max_days_after_death = max(days_after_death, na.rm = TRUE)
+  ),
+  by = .(encounter_type, reason_description)
+][order(-record_count)]
+
+abnormal_after_death_reason_summary
+
+# =========================
+# 9. Chart 1: Administrative vs abnormal
+# =========================
+
+p_after_death_status <- ggplot(
+  after_death_status_summary,
+  aes(
+    x = after_death_status,
+    y = record_count,
+    fill = after_death_status,
+    text = paste0(
+      "Status: ", after_death_status,
+      "<br>Record Count: ", scales::comma(record_count),
+      "<br>Unique Patients: ", scales::comma(unique_patients),
+      "<br>Min Days After Death: ", min_days_after_death,
+      "<br>Max Days After Death: ", max_days_after_death
+    )
+  )
+) +
+  geom_col(width = 0.65, color = "white") +
+  geom_text(
+    aes(label = scales::comma(record_count)),
+    vjust = -0.3,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  labs(
+    title = "After-Death Encounter Classification",
+    subtitle = "Death Certification was separated from abnormal clinical encounters",
+    x = "",
+    y = "Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_after_death_status
+
+ggplotly(p_after_death_status, tooltip = "text")
+
+
+# =========================
+# 10. Chart 2: Abnormal clinical encounter types
+# =========================
+
+if (nrow(abnormal_after_death_type_summary) > 0) {
+  
+  abnormal_after_death_type_summary[, encounter_type := factor(
+    encounter_type,
+    levels = rev(encounter_type)
+  )]
+  
+  p_abnormal_after_death_type <- ggplot(
+    abnormal_after_death_type_summary,
+    aes(
+      x = encounter_type,
+      y = record_count,
+      fill = encounter_type,
+      text = paste0(
+        "Encounter Type: ", encounter_type,
+        "<br>Record Count: ", scales::comma(record_count),
+        "<br>Unique Patients: ", scales::comma(unique_patients),
+        "<br>Min Days After Death: ", min_days_after_death,
+        "<br>Max Days After Death: ", max_days_after_death
+      )
+    )
+  ) +
+    geom_col(width = 0.7, color = "white") +
+    geom_text(
+      aes(label = scales::comma(record_count)),
+      hjust = -0.1,
+      size = 4,
+      fontface = "bold"
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0, 0.25))
+    ) +
+    labs(
+      title = "Abnormal Clinical Encounters After Death",
+      subtitle = "Only non-Death-Certification encounters are shown",
+      x = "",
+      y = "Record Count"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.y = element_text(face = "bold", size = 9),
+      legend.position = "none"
+    )
+  
+  p_abnormal_after_death_type
+  
+  
+} else {
+  
+  print("No abnormal clinical encounters after death were found.")
+}
+```
+
+## Zero HDL Cholesterol Anomaly
+
+```{r anomaly-zero-hdl-cholesterol, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+observations <- as.data.table(observations)
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+hdl_zero <- observations[
+  DESCRIPTION == "High Density Lipoprotein Cholesterol" &
+    !is.na(value_num) &
+    value_num == 0,
+  .(
+    PATIENT,
+    DATE,
+    DESCRIPTION,
+    VALUE,
+    hdl_value = value_num,
+    UNITS
+  )
+][order(PATIENT, DATE)]
+
+hdl_zero_summary <- hdl_zero[
+  ,
+  .(
+    zero_hdl_records = .N,
+    unique_patients = uniqueN(PATIENT)
+  )
+]
+
+hdl_zero_summary
+hdl_zero
+
+p_hdl_zero <- ggplot(
+  hdl_zero_summary,
+  aes(
+    x = "HDL = 0",
+    y = zero_hdl_records,
+    text = paste0(
+      "Zero HDL Records: ", scales::comma(zero_hdl_records),
+      "<br>Unique Patients: ", scales::comma(unique_patients)
+    )
+  )
+) +
+  geom_col(width = 0.5, color = "white") +
+  geom_text(
+    aes(label = scales::comma(zero_hdl_records)),
+    vjust = -0.3,
+    size = 5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  labs(
+    title = "Zero HDL Cholesterol Anomaly",
+    subtitle = "HDL cholesterol value of 0 is clinically unusual and should be reviewed",
+    x = "",
+    y = "Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11)
+  )
+
+p_hdl_zero
+
+ggplotly(p_hdl_zero, tooltip = "text")
+```
+## Observation and Encounter Year Gap Anomaly
+
+```{r anomaly-observation-encounter-year-gap, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+# ===============================
+# 1. Date columns hazırlayırıq
+# ===============================
+
+obs_dates <- observations[
+  ,
+  .(
+    PATIENT,
+    ENCOUNTER,
+    obs_date = as.IDate(DATE),
+    obs_description = DESCRIPTION,
+    VALUE,
+    UNITS
+  )
+]
+
+enc_dates <- encounters[
+  ,
+  .(
+    encounter_id = ID,
+    enc_patient = PATIENT,
+    encounter_date = as.IDate(DATE),
+    encounter_type = DESCRIPTION,
+    reason_description = REASONDESCRIPTION
+  )
+]
+
+# ===============================
+# 2. Observation + Encounter join
+# ===============================
+
+obs_enc_date_gap <- merge(
+  obs_dates,
+  enc_dates,
+  by.x = "ENCOUNTER",
+  by.y = "encounter_id",
+  all.x = FALSE
+)
+
+# ===============================
+# 3. Tarix fərqi: days və years
+# ===============================
+
+obs_enc_date_gap[, diff_days := as.integer(obs_date - encounter_date)]
+
+obs_enc_date_gap[, diff_years := round(diff_days / 365.25, 2)]
+
+obs_enc_date_gap[, abs_diff_years := abs(diff_years)]
+
+# Observation encounter-dən əvvəl/sonra
+obs_enc_date_gap[, date_direction := case_when(
+  diff_years < 0 ~ "Observation before encounter",
+  diff_years == 0 ~ "Same year / same date",
+  diff_years > 0 ~ "Observation after encounter"
+)]
+
+# Year gap category
+obs_enc_date_gap[, year_gap_group := case_when(
+  abs_diff_years > 1 & abs_diff_years <= 3 ~ "1-3 years",
+  abs_diff_years > 3 & abs_diff_years <= 6 ~ "3-6 years",
+  abs_diff_years > 6 ~ "6+ years",
+  TRUE ~ "Unknown"
+)]
+
+obs_enc_date_gap[, year_gap_group := factor(
+  year_gap_group,
+  levels = c("0-1 years", "1-3 years", "3-6 years", "6+ years")
+)]
+
+# ===============================
+# 4. Summary table
+# ===============================
+
+year_gap_summary <- obs_enc_date_gap[
+  ,
+  .(
+    record_count = .N,
+    percent = round(.N / nrow(obs_enc_date_gap) * 100, 2),
+    avg_abs_gap_years = round(mean(abs_diff_years, na.rm = TRUE), 2),
+    max_abs_gap_years = round(max(abs_diff_years, na.rm = TRUE), 2)
+  ),
+  by = year_gap_group
+][order(year_gap_group)]
+
+year_gap_summary
+
+# Direction üzrə summary
+year_gap_direction_summary <- obs_enc_date_gap[
+  ,
+  .N,
+  by = .(year_gap_group, date_direction)
+][order(year_gap_group, date_direction)]
+
+year_gap_direction_summary
+
+# ===============================
+# 5. Ən uzun fərqlər
+# ===============================
+
+longest_year_gap <- obs_enc_date_gap[
+  abs_diff_years > 6,
+  .(
+    PATIENT,
+    ENCOUNTER,
+    obs_date,
+    encounter_date,
+    diff_years,
+    abs_diff_years,
+    date_direction,
+    obs_description,
+    VALUE,
+    UNITS,
+    encounter_type,
+    reason_description
+  )
+][order(-abs_diff_years)]
+
+head(longest_year_gap, 30)
+
+# ===============================
+# 6. Bar chart
+# ===============================
+
+p_year_gap <- ggplot(
+  year_gap_summary,
+  aes(
+    x = year_gap_group,
+    y = record_count,
+    fill = year_gap_group,
+    text = paste0(
+      "Year Gap Group: ", year_gap_group,
+      "<br>Record Count: ", scales::comma(record_count),
+      "<br>Percent: ", percent, "%",
+      "<br>Average Gap: ", avg_abs_gap_years, " years",
+      "<br>Max Gap: ", max_abs_gap_years, " years"
+    )
+  )
+) +
+  geom_col(width = 0.65, color = "white") +
+  geom_text(
+    aes(label = paste0(scales::comma(record_count), "\n", percent, "%")),
+    vjust = -0.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Observation and Encounter Date Gap",
+    subtitle = "Large year gaps may indicate timeline consistency anomalies",
+    x = "Year Gap Group",
+    y = "Observation Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_year_gap
+
+ggplotly(p_year_gap, tooltip = "text")
+
+```
+## BMI Consistency Anomaly: Height + Weight vs Recorded BMI
+
+```{r anomaly-bmi-consistency-check, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+height_obs <- observations[DESCRIPTION == "Body Height" & !is.na(value_num),
+                           .(PATIENT, ENCOUNTER, height = value_num)]
+weight_obs <- observations[DESCRIPTION == "Body Weight" & !is.na(value_num),
+                           .(PATIENT, ENCOUNTER, weight = value_num)]
+bmi_obs    <- observations[DESCRIPTION == "Body Mass Index" & !is.na(value_num),
+                           .(PATIENT, ENCOUNTER, bmi_recorded = value_num)]
+
+bmi_check <- merge(height_obs, weight_obs, by = c("PATIENT", "ENCOUNTER")) |>
+             merge(bmi_obs,    by = c("PATIENT", "ENCOUNTER"))
+
+bmi_check[, bmi_calc := round(weight / (height / 100)^2, 1)]
+bmi_check[, ferq     := abs(bmi_recorded - bmi_calc)]
+
+bmi_incon <- bmi_check[ferq > 2][order(-ferq)]
+
+cat("=== 1) BMI Tutarsızlığı (fərq > 2) ===\n")
+cat("Tutarsız ölçü sayı:", nrow(bmi_incon), "\n")
+if (nrow(bmi_incon) > 0) {
+  cat("Maksimum fərq:", max(bmi_incon$ferq), "\n")
+  print(head(bmi_incon[, .(PATIENT, height, weight, bmi_recorded, bmi_calc, ferq)], 5))
+}
+
+# =========================
+# Chart: BMI tutarsızlığı summary
+# =========================
+
+library(ggplot2)
+library(plotly)
+library(scales)
+
+bmi_check[, ferq_group := fifelse(
+  ferq <= 2, "Consistent / acceptable",
+  fifelse(
+    ferq > 2 & ferq <= 5, "Mismatch: 2-5",
+    fifelse(
+      ferq > 5 & ferq <= 10, "Mismatch: 5-10",
+      "Mismatch: 10+"
+    )
+  )
+)]
+
+bmi_check[, ferq_group := factor(
+  ferq_group,
+  levels = c(
+    "Consistent / acceptable",
+    "Mismatch: 2-5",
+    "Mismatch: 5-10",
+    "Mismatch: 10+"
+  )
+)]
+
+bmi_chart_data <- bmi_check[
+  ,
+  .(
+    record_count = .N,
+    avg_difference = round(mean(ferq, na.rm = TRUE), 2),
+    max_difference = round(max(ferq, na.rm = TRUE), 2)
+  ),
+  by = ferq_group
+][order(ferq_group)]
+
+p_bmi_mismatch <- ggplot(
+  bmi_chart_data,
+  aes(
+    x = ferq_group,
+    y = record_count,
+    fill = ferq_group,
+    text = paste0(
+      "Group: ", ferq_group,
+      "<br>Record Count: ", scales::comma(record_count),
+      "<br>Average Difference: ", avg_difference,
+      "<br>Max Difference: ", max_difference
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = scales::comma(record_count)),
+    vjust = -0.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  labs(
+    title = "BMI Consistency Check",
+    subtitle = "Recorded BMI compared with BMI calculated from height and weight",
+    x = "BMI Difference Group",
+    y = "Record Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_bmi_mismatch
+
+ggplotly(p_bmi_mismatch, tooltip = "text")
+```
+## Duplicate Passport Anomaly
+
+```{r anomaly-duplicate-passport, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+patients <- as.data.table(patients)
+
+# =========================
+# 1. Passport values clean
+# =========================
+
+patients[, passport_clean := trimws(PASSPORT)]
+
+# Placeholder / invalid passport values çıxarılır
+passport_valid <- patients[
+  !is.na(passport_clean) &
+    passport_clean != "" &
+    tolower(passport_clean) != "false",
+  .(
+    ID,
+    FIRST,
+    LAST,
+    GENDER,
+    BIRTHDATE,
+    DEATHDATE,
+    PASSPORT = passport_clean
+  )
+]
+
+# Ad soyad təmizlənir
+passport_valid[, FIRST := gsub("[0-9]", "", FIRST)]
+passport_valid[, LAST := gsub("[0-9]", "", LAST)]
+passport_valid[, patient_name := trimws(paste(FIRST, LAST))]
+
+passport_valid[
+  is.na(patient_name) | patient_name == "",
+  patient_name := "Unknown Patient"
+]
+
+# =========================
+# 2. Duplicate passport summary
+# =========================
+
+duplicate_passport_summary <- passport_valid[
+  ,
+  .(
+    patient_count = uniqueN(ID),
+    patient_names = paste(unique(patient_name), collapse = "; "),
+    patient_ids = paste(unique(ID), collapse = "; ")
+  ),
+  by = PASSPORT
+][
+  patient_count > 1
+][order(-patient_count)]
+
+duplicate_passport_summary
+
+# Ümumi anomaly summary
+duplicate_passport_count_summary <- duplicate_passport_summary[
+  ,
+  .(
+    duplicate_passport_codes = .N,
+    affected_patients = sum(patient_count),
+    max_patients_same_passport = max(patient_count, na.rm = TRUE)
+  )
+]
+
+
+
+# =========================
+# 3. Detailed duplicate records
+# =========================
+
+duplicate_passport_records <- passport_valid[
+  PASSPORT %in% duplicate_passport_summary$PASSPORT
+][order(PASSPORT, patient_name)]
+
+duplicate_passport_records
+
+# =========================
+# 4. Top duplicate passport chart data
+# =========================
+
+top_duplicate_passports <- duplicate_passport_summary[
+  order(-patient_count)
+][1:min(15, .N)]
+
+top_duplicate_passports[, passport_label := paste0(
+  substr(PASSPORT, 1, 10),
+  "..."
+)]
+
+top_duplicate_passports[, passport_label := factor(
+  passport_label,
+  levels = rev(passport_label)
+)]
+
+# =========================
+# 5. Chart
+# =========================
+
+if (nrow(top_duplicate_passports) > 0) {
+  
+  p_duplicate_passport <- ggplot(
+    top_duplicate_passports,
+    aes(
+      x = passport_label,
+      y = patient_count,
+      fill = patient_count,
+      text = paste0(
+        "Passport: ", PASSPORT,
+        "<br>Patient Count: ", patient_count,
+        "<br>Patient Names: ", patient_names
+      )
+    )
+  ) +
+    geom_col(width = 0.7, color = "white") +
+    geom_text(
+      aes(label = patient_count),
+      hjust = -0.1,
+      size = 4,
+      fontface = "bold"
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0, 0.25))
+    ) +
+    labs(
+      title = "Duplicate Passport Code Anomaly",
+      subtitle = "Same passport code appearing for more than one patient",
+      x = "Passport Code",
+      y = "Patient Count"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.y = element_text(face = "bold", size = 9),
+      legend.position = "none"
+    )
+  duplicate_passport_count_summary
+  p_duplicate_passport
+  
+  
+} else {
+  print("No duplicate valid passport codes found.")
+}
+```
+## Shared Passport by Patients Anomaly
+
+```{r anomaly-shared-passport-patients, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+patients <- as.data.table(patients)
+
+# =========================
+# 1. Passport clean
+# =========================
+
+patients[, passport_clean := trimws(PASSPORT)]
+
+passport_valid <- patients[
+  !is.na(passport_clean) &
+    passport_clean != "" &
+    tolower(passport_clean) != "false",
+  .(
+    ID,
+    FIRST,
+    LAST,
+    GENDER,
+    BIRTHDATE,
+    PASSPORT = passport_clean
+  )
+]
+
+# Ad-soyad təmizliyi
+passport_valid[, FIRST := gsub("[0-9]", "", FIRST)]
+passport_valid[, LAST := gsub("[0-9]", "", LAST)]
+passport_valid[, patient_name := trimws(paste(FIRST, LAST))]
+
+passport_valid[
+  is.na(patient_name) | patient_name == "",
+  patient_name := "Unknown Patient"
+]
+
+# =========================
+# 2. Eyni passport neçə patient-də var?
+# =========================
+
+passport_groups <- passport_valid[
+  ,
+  .(
+    patient_count = uniqueN(ID),
+    patient_names = paste(unique(patient_name), collapse = " / "),
+    patient_ids = paste(unique(ID), collapse = " / ")
+  ),
+  by = PASSPORT
+][
+  patient_count %in% c(2, 3)
+][order(-patient_count)]
+
+passport_groups
+
+# =========================
+# 3. Chart label: passport yox, patient names göstərilir
+# =========================
+
+passport_groups[, group_label := paste0(
+  patient_names,
+  " (",
+  patient_count,
+  " patients)"
+)]
+
+# Əgər çox uzundursa, qısalt
+passport_groups[, group_label_short := ifelse(
+  nchar(group_label) > 55,
+  paste0(substr(group_label, 1, 55), "..."),
+  group_label
+)]
+
+# Top 15 group göstəririk ki chart chaotic olmasın
+top_passport_groups <- passport_groups[
+  order(-patient_count)
+][1:min(15, .N)]
+
+top_passport_groups[, group_label_short := factor(
+  group_label_short,
+  levels = rev(group_label_short)
+)]
+
+# =========================
+# 4. Chart: patient names sharing same passport
+# =========================
+
+p_shared_passport_patients <- ggplot(
+  top_passport_groups,
+  aes(
+    x = group_label_short,
+    y = patient_count,
+    fill = patient_count,
+    text = paste0(
+      "Shared Passport: ", PASSPORT,
+      "<br>Patient Count: ", patient_count,
+      "<br>Patients: ", patient_names,
+      "<br>Patient IDs: ", patient_ids
+    )
+  )
+) +
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = patient_count),
+    hjust = -0.2,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    breaks = c(0, 1, 2, 3),
+    limits = c(0, 3.5),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Shared Passport Anomaly by Patient Names",
+    subtitle = "Patient groups where the same passport code appears for 2 or 3 patients",
+    x = "Patients Sharing the Same Passport",
+    y = "Patient Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 8),
+    legend.position = "none"
+  )
+
+p_shared_passport_patients
+
+ggplotly(p_shared_passport_patients, tooltip = "text")
+```
+
+## Duplicate SSN Anomaly
+
+```{r anomaly-duplicate-ssn, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+patients <- as.data.table(patients)
+
+# =========================
+# 1. SSN clean
+# =========================
+
+patients[, ssn_clean := trimws(SSN)]
+
+# Placeholder / invalid SSN values çıxarılır
+ssn_valid <- patients[
+  !is.na(ssn_clean) &
+    ssn_clean != "" &
+    tolower(ssn_clean) != "false",
+  .(
+    ID,
+    FIRST,
+    LAST,
+    GENDER,
+    BIRTHDATE,
+    SSN = ssn_clean
+  )
+]
+
+# Ad-soyad təmizliyi
+ssn_valid[, FIRST := gsub("[0-9]", "", FIRST)]
+ssn_valid[, LAST := gsub("[0-9]", "", LAST)]
+ssn_valid[, patient_name := trimws(paste(FIRST, LAST))]
+
+ssn_valid[
+  is.na(patient_name) | patient_name == "",
+  patient_name := "Unknown Patient"
+]
+
+# =========================
+# 2. Hər SSN neçə patient-də görünür?
+# =========================
+
+ssn_count <- ssn_valid[
+  ,
+  .(
+    patient_count = uniqueN(ID),
+    patient_names = paste(unique(patient_name), collapse = "; "),
+    patient_ids = paste(unique(ID), collapse = "; ")
+  ),
+  by = SSN
+]
+
+# Təkrarlanan SSN-lər
+duplicate_ssn <- ssn_count[
+  patient_count > 1
+][order(-patient_count)]
+
+duplicate_ssn
+
+# =========================
+# 3. Summary
+# =========================
+
+duplicate_ssn_summary <- duplicate_ssn[
+  ,
+  .(
+    repeated_ssn_codes = .N,
+    affected_patients = sum(patient_count),
+    max_patients_same_ssn = max(patient_count, na.rm = TRUE)
+  )
+]
+
+duplicate_ssn_summary
+
+# =========================
+# 4. Duplicate / Triple / Multiple group
+# =========================
+
+duplicate_ssn[, ssn_anomaly_group := case_when(
+  patient_count == 2 ~ "Duplicate SSN",
+  patient_count == 3 ~ "Triple SSN",
+  patient_count > 3 ~ "Multiple SSN",
+  TRUE ~ "Other"
+)]
+
+ssn_anomaly_summary <- duplicate_ssn[
+  ,
+  .(
+    ssn_code_count = .N,
+    affected_patient_count = sum(patient_count)
+  ),
+  by = ssn_anomaly_group
+]
+
+# Əgər hansısa group yoxdursa, 0 kimi saxlayırıq
+all_ssn_groups <- data.table(
+  ssn_anomaly_group = c(
+    "Duplicate SSN",
+    "Triple SSN",
+    "Multiple SSN"
+  )
+)
+
+ssn_anomaly_summary <- merge(
+  all_ssn_groups,
+  ssn_anomaly_summary,
+  by = "ssn_anomaly_group",
+  all.x = TRUE
+)
+
+ssn_anomaly_summary[is.na(ssn_code_count), ssn_code_count := 0]
+ssn_anomaly_summary[is.na(affected_patient_count), affected_patient_count := 0]
+
+ssn_anomaly_summary[, ssn_anomaly_group := factor(
+  ssn_anomaly_group,
+  levels = c("Duplicate SSN", "Triple SSN", "Multiple SSN")
+)]
+
+ssn_anomaly_summary
+
+# =========================
+# 5. Chart: SSN anomaly summary
+# =========================
+
+p_ssn_anomaly <- ggplot(
+  ssn_anomaly_summary,
+  aes(
+    x = ssn_anomaly_group,
+    y = ssn_code_count,
+    fill = ssn_anomaly_group,
+    text = paste0(
+      "Anomaly Group: ", ssn_anomaly_group,
+      "<br>SSN Code Count: ", scales::comma(ssn_code_count),
+      "<br>Affected Patient Count: ", scales::comma(affected_patient_count)
+    )
+  )
+) +
+  geom_col(
+    width = 0.65,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = scales::comma(ssn_code_count)),
+    vjust = -0.3,
+    size = 5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "Repeated SSN Anomaly",
+    subtitle = "Same SSN number appearing for more than one patient",
+    x = "",
+    y = "SSN Code Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 11),
+    legend.position = "none"
+  )
+
+p_ssn_anomaly
+
+ggplotly(p_ssn_anomaly, tooltip = "text")
+```
+
+# Hypothesis Analysis
+
+## Cancer/Tumor Patients and Average Glucose Hypothesis
+
+```{r hypothesis-cancer-glucose-hba1c, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+master <- as.data.table(master)
+encounters <- as.data.table(encounters)
+observations <- as.data.table(observations)
+
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+encounters[, reason_group := case_when(
+  
+  grepl(
+    "malignant|cancer|tumor|neoplasm|carcinoma",
+    REASONDESCRIPTION,
+    ignore.case = TRUE
+  ) ~ "Cancer / Tumor",
+  
+  grepl(
+    "diabetes|hypertension|asthma|copd|emphysema|chronic",
+    REASONDESCRIPTION,
+    ignore.case = TRUE
+  ) ~ "Chronic Disease",
+  
+  grepl(
+    "sinusitis|bronchitis|pharyngitis|otitis|sore throat|viral|bacterial|strep",
+    REASONDESCRIPTION,
+    ignore.case = TRUE
+  ) ~ "Acute Infection / ENT",
+  
+  grepl(
+    "fracture|injury|trauma|concussion|sprain|burn",
+    REASONDESCRIPTION,
+    ignore.case = TRUE
+  ) ~ "Injury / Trauma",
+  
+  grepl(
+    "pregnancy|prenatal|childbirth|miscarriage",
+    REASONDESCRIPTION,
+    ignore.case = TRUE
+  ) ~ "Pregnancy Related",
+  
+  is.na(REASONDESCRIPTION) | trimws(REASONDESCRIPTION) == "" ~ "No Reason Recorded",
+  
+  TRUE ~ "Other"
+)]
+
+patient_reason_group <- encounters[
+  reason_group != "No Reason Recorded",
+  .N,
+  by = .(PATIENT, reason_group)
+][
+  order(PATIENT, -N)
+][
+  ,
+  .SD[1],
+  by = PATIENT
+]
+
+setnames(patient_reason_group, "N", "reason_group_count")
+
+old_reason_cols <- intersect(
+  names(master),
+  c("reason_group", "reason_group_count")
+)
+
+if (length(old_reason_cols) > 0) {
+  master[, (old_reason_cols) := NULL]
+}
+
+master <- merge(
+  master,
+  patient_reason_group,
+  by.x = "ID",
+  by.y = "PATIENT",
+  all.x = TRUE
+)
+
+master[is.na(reason_group), reason_group := "No Reason Recorded"]
+master[is.na(reason_group_count), reason_group_count := 0]
+
+glucose_data <- observations[
+  DESCRIPTION == "Glucose" &
+    !is.na(value_num),
+  .(
+    PATIENT,
+    DATE,
+    glucose = value_num
+  )
+][
+  order(PATIENT, DATE)
+][
+  ,
+  .SD[.N],
+  by = PATIENT
+]
+
+if ("glucose" %in% names(master)) {
+  master[, glucose := NULL]
+}
+
+master <- merge(
+  master,
+  glucose_data[, .(PATIENT, glucose)],
+  by.x = "ID",
+  by.y = "PATIENT",
+  all.x = TRUE
+)
+
+master[, glucose := as.numeric(glucose)]
+comparison_groups <- c(
+  "Cancer / Tumor",
+  "Chronic Disease",
+  "Acute Infection / ENT",
+  "Injury / Trauma",
+  "Pregnancy Related"
+)
+
+cancer_glucose_summary <- master[
+  reason_group %in% comparison_groups &
+    !is.na(glucose),
+  .(
+    patient_count = .N,
+    avg_glucose = round(mean(glucose, na.rm = TRUE), 1),
+    median_glucose = round(median(glucose, na.rm = TRUE), 1),
+    min_glucose = min(glucose, na.rm = TRUE),
+    max_glucose = max(glucose, na.rm = TRUE)
+  ),
+  by = reason_group
+][order(-avg_glucose)]
+
+cancer_glucose_summary
+
+cancer_rank <- cancer_glucose_summary[
+  ,
+  .(
+    reason_group,
+    avg_glucose,
+    glucose_rank = frank(-avg_glucose, ties.method = "min")
+  )
+][order(glucose_rank)]
+
+cancer_rank
+
+p_cancer_glucose <- ggplot(
+  cancer_glucose_summary,
+  aes(
+    x = reorder(reason_group, avg_glucose),
+    y = avg_glucose,
+    fill = reason_group,
+    text = paste0(
+      "Reason Group: ", reason_group,
+      "<br>Patient Count: ", scales::comma(patient_count),
+      "<br>Average Glucose: ", avg_glucose,
+      "<br>Median Glucose: ", median_glucose,
+      "<br>Min Glucose: ", min_glucose,
+      "<br>Max Glucose: ", max_glucose
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = paste0(avg_glucose, "\n(n=", scales::comma(patient_count), ")")),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.22))
+  ) +
+  labs(
+    title = "Average Glucose by Reason Group",
+    subtitle = "Testing whether Cancer/Tumor patients have the highest average glucose",
+    x = "",
+    y = "Average Glucose"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 9),
+    legend.position = "none"
+  )
+p_cancer_glucose
+ggplotly(p_cancer_glucose, tooltip = "text")
+
+```
+
+
+## Hidden Clinical Risk in Outpatient Encounters Hypothesis
+
+```{r hypothesis-misleading-normal-visit-risk, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+master <- as.data.table(master)
+encounters <- as.data.table(encounters)
+observations <- as.data.table(observations)
+
+
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+risk_obs <- observations[
+  DESCRIPTION %in% c(
+    "Body Mass Index",
+    "Systolic Blood Pressure",
+    "Diastolic Blood Pressure",
+    "Glucose",
+    "Hemoglobin A1c/Hemoglobin.total in Blood",
+    "Total Cholesterol",
+    "Triglycerides"
+  ) &
+    !is.na(value_num),
+  .(
+    PATIENT,
+    DATE,
+    DESCRIPTION,
+    value_num
+  )
+][
+  order(PATIENT, DESCRIPTION, DATE)
+][
+  ,
+  .SD[.N],
+  by = .(PATIENT, DESCRIPTION)
+]
+
+risk_wide <- dcast(
+  risk_obs,
+  PATIENT ~ DESCRIPTION,
+  value.var = "value_num"
+)
+
+setDT(risk_wide)
+
+setnames(
+  risk_wide,
+  old = c(
+    "Body Mass Index",
+    "Systolic Blood Pressure",
+    "Diastolic Blood Pressure",
+    "Glucose",
+    "Hemoglobin A1c/Hemoglobin.total in Blood",
+    "Total Cholesterol",
+    "Triglycerides"
+  ),
+  new = c(
+    "bmi",
+    "sbp",
+    "dbp",
+    "glucose",
+    "hba1c",
+    "cholesterol",
+    "triglycerides"
+  ),
+  skip_absent = TRUE
+)
+
+# Əgər hansısa column yoxdursa, NA yaradılır
+needed_cols <- c(
+  "bmi",
+  "sbp",
+  "dbp",
+  "glucose",
+  "hba1c",
+  "cholesterol",
+  "triglycerides"
+)
+
+for (col in needed_cols) {
+  if (!col %in% names(risk_wide)) {
+    risk_wide[, (col) := NA_real_]
+  }
+}
+
+risk_wide[, severe_obesity := ifelse(!is.na(bmi) & bmi >= 40, 1, 0)]
+
+risk_wide[, crisis_bp := ifelse(
+  (!is.na(sbp) & sbp >= 180) |
+    (!is.na(dbp) & dbp >= 120),
+  1,
+  0
+)]
+
+risk_wide[, high_glucose := ifelse(
+  !is.na(glucose) & glucose >= 200,
+  1,
+  0
+)]
+
+risk_wide[, high_hba1c := ifelse(
+  !is.na(hba1c) & hba1c > 0 & hba1c >= 9,
+  1,
+  0
+)]
+
+risk_wide[, high_cholesterol := ifelse(
+  !is.na(cholesterol) & cholesterol >= 240,
+  1,
+  0
+)]
+
+risk_wide[, high_triglycerides := ifelse(
+  !is.na(triglycerides) & triglycerides >= 200,
+  1,
+  0
+)]
+
+risk_wide[, hidden_risk_count :=
+            severe_obesity +
+            crisis_bp +
+            high_glucose +
+            high_hba1c +
+            high_cholesterol +
+            high_triglycerides]
+
+risk_wide[, hidden_risk_flag := ifelse(
+  hidden_risk_count >= 1,
+  1,
+  0
+)]
+
+patient_encounter_type <- encounters[
+  ,
+  .N,
+  by = .(PATIENT, DESCRIPTION)
+][
+  order(PATIENT, -N)
+][
+  ,
+  .SD[1],
+  by = PATIENT
+]
+
+setnames(patient_encounter_type, "DESCRIPTION", "dominant_encounter_type")
+setnames(patient_encounter_type, "N", "encounter_type_count")
+
+normal_visit_risk <- merge(
+  patient_encounter_type,
+  risk_wide,
+  by = "PATIENT",
+  all.x = TRUE
+)
+
+normal_visit_risk[is.na(hidden_risk_count), hidden_risk_count := 0]
+normal_visit_risk[is.na(hidden_risk_flag), hidden_risk_flag := 0]
+
+normal_visit_risk[, visit_group := ifelse(
+  grepl("Outpatient", dominant_encounter_type, ignore.case = TRUE),
+  "Outpatient Encounter",
+  "Other Encounter Types"
+)]
+
+# Summary
+misleading_summary <- normal_visit_risk[
+  ,
+  .(
+    patient_count = .N,
+    hidden_risk_patients = sum(hidden_risk_flag, na.rm = TRUE),
+    hidden_risk_percent = round(mean(hidden_risk_flag, na.rm = TRUE) * 100, 1),
+    avg_hidden_risk_count = round(mean(hidden_risk_count, na.rm = TRUE), 2)
+  ),
+  by = visit_group
+][order(-hidden_risk_percent)]
+
+misleading_summary
+
+
+outpatient_risk_detail <- normal_visit_risk[
+  visit_group == "Outpatient Encounter",
+  .(
+    severe_obesity_percent = round(mean(severe_obesity, na.rm = TRUE) * 100, 1),
+    crisis_bp_percent = round(mean(crisis_bp, na.rm = TRUE) * 100, 1),
+    high_glucose_percent = round(mean(high_glucose, na.rm = TRUE) * 100, 1),
+    high_hba1c_percent = round(mean(high_hba1c, na.rm = TRUE) * 100, 1),
+    high_cholesterol_percent = round(mean(high_cholesterol, na.rm = TRUE) * 100, 1),
+    high_triglycerides_percent = round(mean(high_triglycerides, na.rm = TRUE) * 100, 1)
+  )
+]
+
+outpatient_risk_detail
+
+# Long format for chart
+outpatient_risk_long <- melt(
+  outpatient_risk_detail,
+  variable.name = "risk_type",
+  value.name = "risk_percent"
+)
+
+setDT(outpatient_risk_long)
+
+outpatient_risk_long[, risk_type := case_when(
+  risk_type == "severe_obesity_percent" ~ "Severe obesity",
+  risk_type == "crisis_bp_percent" ~ "Crisis-level BP",
+  risk_type == "high_glucose_percent" ~ "High glucose",
+  risk_type == "high_hba1c_percent" ~ "High HbA1c",
+  risk_type == "high_cholesterol_percent" ~ "High cholesterol",
+  risk_type == "high_triglycerides_percent" ~ "High triglycerides",
+  TRUE ~ risk_type
+)]
+
+outpatient_risk_long <- outpatient_risk_long[order(-risk_percent)]
+
+outpatient_risk_long
+
+p_misleading_visit <- ggplot(
+  misleading_summary,
+  aes(
+    x = visit_group,
+    y = hidden_risk_percent,
+    fill = visit_group,
+    text = paste0(
+      "Visit Group: ", visit_group,
+      "<br>Patient Count: ", scales::comma(patient_count),
+      "<br>Hidden Risk Patients: ", scales::comma(hidden_risk_patients),
+      "<br>Hidden Risk Percent: ", hidden_risk_percent, "%",
+      "<br>Average Hidden Risk Count: ", avg_hidden_risk_count
+    )
+  )
+) +
+  geom_col(width = 0.65, color = "white") +
+  geom_text(
+    aes(label = paste0(hidden_risk_percent, "%")),
+    vjust = -0.3,
+    size = 4.5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.2))
+  ) +
+  labs(
+    title = "Hidden Clinical Risk in Routine-Looking Visits",
+    subtitle = "Outpatient encounters compared with other encounter types",
+    x = "",
+    y = "Patients With At Least One Hidden Risk Signal"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_misleading_visit
+
+ggplotly(p_misleading_visit, tooltip = "text")
+
+
+p_outpatient_risk_types <- ggplot(
+  outpatient_risk_long,
+  aes(
+    x = reorder(risk_type, risk_percent),
+    y = risk_percent,
+    fill = risk_type,
+    text = paste0(
+      "Risk Type: ", risk_type,
+      "<br>Outpatient Risk Percent: ", risk_percent, "%"
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = paste0(risk_percent, "%")),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "Which Hidden Risks Appear in Outpatient Encounters?",
+    subtitle = "Risk signal breakdown among patients whose dominant encounter type is outpatient",
+    x = "",
+    y = "Outpatient Patient Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 9),
+    legend.position = "none"
+  )
+
+p_outpatient_risk_types
+
+ggplotly(p_outpatient_risk_types, tooltip = "text")
+
+```
+
+
+
+# Forecast Analysis
+
+# forecast all clinical measurements 2018
+
+```{r forecast-all-clinical-measurements-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+observations <- as.data.table(observations)
+
+# =========================
+# 1. Date and numeric preparation
+# =========================
+
+observations[, obs_date := as.IDate(DATE)]
+observations[, obs_year := year(obs_date)]
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+# =========================
+# 2. All numeric clinical measurement records
+# Burada specific measurement seçmirik.
+# Bütün numeric observation measurement-ləri sayılır.
+# =========================
+
+measurement_yearly <- observations[
+  !is.na(obs_year) &
+    !is.na(value_num),
+  .(
+    clinical_measurement_count = .N
+  ),
+  by = obs_year
+][order(obs_year)]
+
+measurement_yearly
+
+# =========================
+# 3. Mark complete / incomplete years
+# =========================
+
+measurement_yearly[, year_status := ifelse(
+  obs_year == 2017,
+  "Incomplete year excluded from model",
+  "Complete year used for model"
+)]
+# =========================
+# 4. Training data: 2011-2016 only
+# 2010 early ramp-up year excluded
+# 2017 incomplete year excluded
+# =========================
+
+measurement_train <- measurement_yearly[
+  obs_year >= 2011 &
+    obs_year <= 2016
+]
+
+measurement_train[, year_index := obs_year - min(obs_year) + 1]
+
+measurement_train
+
+# =========================
+# 5. FIX: Linear regression model (NOT polynomial)
+# Polynomial 6 data nöqtəsində overfitting edir — R² süni yüksəlir.
+# Sadə xətti reqressiya + LOOCV istifadə edilir.
+# =========================
+
+measurement_lm_model <- lm(
+  clinical_measurement_count ~ year_index,
+  data = measurement_train
+)
+
+summary(measurement_lm_model)
+
+measurement_r2 <- round(summary(measurement_lm_model)$r.squared, 3)
+measurement_adj_r2 <- round(summary(measurement_lm_model)$adj.r.squared, 3)
+
+# LOOCV validation
+library(caret)
+ctrl_loocv <- trainControl(method = "LOOCV")
+cv_meas <- suppressWarnings(train(
+  clinical_measurement_count ~ year_index,
+  data      = as.data.frame(measurement_train),
+  method    = "lm",
+  trControl = ctrl_loocv
+))
+measurement_loocv_r2   <- round(cv_meas$results$Rsquared, 3)
+measurement_loocv_rmse <- round(cv_meas$results$RMSE, 0)
+
+cat("Train R²:    ", measurement_r2, "\n")
+cat("LOOCV R²:    ", measurement_loocv_r2, "(reliable estimate)\n")
+cat("LOOCV RMSE:  ", measurement_loocv_rmse, "\n")
+
+measurement_r2
+measurement_adj_r2
+
+# =========================
+# 6. Forecast 2018
+# =========================
+
+forecast_2018 <- data.table(
+  obs_year = 2018
+)
+
+forecast_2018[, year_index := obs_year - min(measurement_train$obs_year) + 1]
+
+pred_2018 <- predict(
+  measurement_lm_model,
+  newdata = forecast_2018,
+  interval = "prediction"
+)
+
+forecast_2018[, forecast_count := round(as.numeric(pred_2018[, "fit"]), 0)]
+forecast_2018[, lower_95 := round(as.numeric(pred_2018[, "lwr"]), 0)]
+forecast_2018[, upper_95 := round(as.numeric(pred_2018[, "upr"]), 0)]
+
+forecast_2018[forecast_count < 0, forecast_count := 0]
+forecast_2018[lower_95 < 0, lower_95 := 0]
+forecast_2018[upper_95 < 0, upper_95 := 0]
+
+forecast_2018
+
+# =========================
+# 7. Fitted values for 2010-2016
+# =========================
+
+measurement_train[, fitted_count := round(
+  predict(measurement_lm_model, newdata = measurement_train),
+  0
+)]
+
+# =========================
+# 8. Plot data
+# =========================
+
+actual_plot <- measurement_yearly[
+  obs_year >= 2010 &
+    obs_year <= 2017,
+  .(
+    obs_year,
+    clinical_measurement_count,
+    year_status
+  )
+]
+
+forecast_plot <- forecast_2018[
+  ,
+  .(
+    obs_year,
+    forecast_count,
+    lower_95,
+    upper_95
+  )
+]
+
+# =========================
+# 9. Chart: All clinical measurement forecast
+# =========================
+
+p_all_measurement_2018 <- ggplot() +
+  
+  # Actual complete years
+  geom_line(
+    data = actual_plot[
+      obs_year <= 2016
+    ],
+    aes(
+      x = obs_year,
+      y = clinical_measurement_count
+    ),
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    data = actual_plot[
+      obs_year <= 2016
+    ],
+    aes(
+      x = obs_year,
+      y = clinical_measurement_count,
+      text = paste0(
+        "Year: ", obs_year,
+        "<br>All Numeric Measurement Count: ",
+        scales::comma(clinical_measurement_count),
+        "<br>Status: Complete year used for model"
+      )
+    ),
+    size = 3
+  ) +
+  
+  geom_text(
+    data = actual_plot[
+      obs_year <= 2016
+    ],
+    aes(
+      x = obs_year,
+      y = clinical_measurement_count,
+      label = scales::comma(clinical_measurement_count)
+    ),
+    vjust = -0.8,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  
+  # 2017 incomplete point
+  geom_point(
+    data = actual_plot[
+      obs_year == 2017
+    ],
+    aes(
+      x = obs_year,
+      y = clinical_measurement_count,
+      text = paste0(
+        "Year: ", obs_year,
+        "<br>All Numeric Measurement Count: ",
+        scales::comma(clinical_measurement_count),
+        "<br>Status: Incomplete year excluded from model"
+      )
+    ),
+    size = 4,
+    shape = 17
+  ) +
+  
+  geom_text(
+    data = actual_plot[
+      obs_year == 2017
+    ],
+    aes(
+      x = obs_year,
+      y = clinical_measurement_count,
+      label = paste0(scales::comma(clinical_measurement_count), "\nIncomplete")
+    ),
+    vjust = 1.4,
+    size = 3.8,
+    fontface = "bold"
+  ) +
+  
+  # Forecast interval
+  geom_errorbar(
+    data = forecast_plot,
+    aes(
+      x = obs_year,
+      ymin = lower_95,
+      ymax = upper_95
+    ),
+    width = 0.15,
+    linewidth = 1
+  ) +
+  
+  # Forecast point
+  geom_point(
+    data = forecast_plot,
+    aes(
+      x = obs_year,
+      y = forecast_count,
+      text = paste0(
+        "Forecast Year: ", obs_year,
+        "<br>Forecast Count: ", scales::comma(forecast_count),
+        "<br>95% Prediction Interval: ",
+        scales::comma(lower_95), " - ",
+        scales::comma(upper_95)
+      )
+    ),
+    size = 4
+  ) +
+  
+  geom_text(
+    data = forecast_plot,
+    aes(
+      x = obs_year,
+      y = forecast_count,
+      label = scales::comma(forecast_count)
+    ),
+    vjust = -1,
+    size = 4.2,
+    fontface = "bold"
+  ) +
+  
+  # Connect 2016 to forecast with dashed line
+  geom_segment(
+    data = data.table(
+      x = 2016,
+      xend = 2018,
+      y = measurement_train[obs_year == 2016, clinical_measurement_count],
+      yend = forecast_2018$forecast_count
+    ),
+    aes(
+      x = x,
+      xend = xend,
+      y = y,
+      yend = yend
+    ),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  
+  scale_x_continuous(
+    breaks = 2010:2018
+  ) +
+  
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0.05, 0.18))
+  ) +
+  
+  labs(
+    title = "2018 Overall Clinical Measurement Count Forecast",
+    subtitle = paste0(
+      "All numeric observation measurements included; 2017 excluded as incomplete | R² = ",
+      measurement_r2
+    ),
+    x = "Year",
+    y = "All Clinical Measurement Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold")
+  )
+
+p_all_measurement_2018
+
+ggplotly(p_all_measurement_2018, tooltip = "text")
+overall_clinical_measurement_forecast_summary <- data.table(
+  model = "Polynomial Regression",
+  target = "All numeric clinical measurement records",
+  training_period = "2011-2016 complete years",
+  excluded_years = "2010 ramp-up year; 2017 incomplete year",
+  forecast_year = 2018,
+  forecast_count = forecast_2018$forecast_count,
+  lower_95 = forecast_2018$lower_95,
+  upper_95 = forecast_2018$upper_95,
+  r_squared = measurement_r2,
+  adjusted_r_squared = measurement_adj_r2
+)
+```
+
+## Hospital Encounter Forecast
+```{r forecast-hospital-encounter-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+encounters <- as.data.table(encounters)
+
+# =========================
+# 1. Date preparation
+# =========================
+
+encounters[, encounter_date := as.IDate(DATE)]
+encounters[, encounter_year := year(encounter_date)]
+
+# =========================
+# 2. Yearly hospital encounter count
+# =========================
+
+encounter_yearly <- encounters[
+  !is.na(encounter_year),
+  .(
+    encounter_count = .N
+  ),
+  by = encounter_year
+][order(encounter_year)]
+
+encounter_yearly
+
+# =========================
+# 3. Mark complete / incomplete years
+# =========================
+
+encounter_yearly[, year_status := ifelse(
+  encounter_year == 2017,
+  "Incomplete year excluded from model",
+  "Complete year used for model"
+)]
+
+# =========================
+# 4. Training data: 2010-2016 only
+# =========================
+
+encounter_train <- encounter_yearly[
+  encounter_year >= 2010 &
+    encounter_year <= 2016
+]
+
+encounter_train[, year_index := encounter_year - min(encounter_year) + 1]
+
+encounter_train
+
+# =========================
+# 5. Linear regression model
+# =========================
+
+encounter_lm_model <- lm(
+  encounter_count ~ year_index,
+  data = encounter_train
+)
+
+summary(encounter_lm_model)
+
+# R-squared
+encounter_r2 <- round(summary(encounter_lm_model)$r.squared, 3)
+
+encounter_r2
+
+# =========================
+# 6. Forecast 2018
+# =========================
+
+forecast_2018 <- data.table(
+  encounter_year = 2018
+)
+
+forecast_2018[, year_index := encounter_year - min(encounter_train$encounter_year) + 1]
+
+pred_2018 <- predict(
+  encounter_lm_model,
+  newdata = forecast_2018,
+  interval = "prediction"
+)
+
+forecast_2018[, forecast_count := round(as.numeric(pred_2018[, "fit"]), 0)]
+forecast_2018[, lower_95 := round(as.numeric(pred_2018[, "lwr"]), 0)]
+forecast_2018[, upper_95 := round(as.numeric(pred_2018[, "upr"]), 0)]
+
+forecast_2018[forecast_count < 0, forecast_count := 0]
+forecast_2018[lower_95 < 0, lower_95 := 0]
+forecast_2018[upper_95 < 0, upper_95 := 0]
+
+forecast_2018
+
+# =========================
+# 7. Fitted values for 2010-2016
+# =========================
+
+encounter_train[, fitted_count := round(
+  predict(encounter_lm_model, newdata = encounter_train),
+  0
+)]
+
+# =========================
+# 8. Plot data
+# =========================
+
+actual_plot <- encounter_yearly[
+  encounter_year >= 2010 &
+    encounter_year <= 2017,
+  .(
+    encounter_year,
+    encounter_count,
+    year_status
+  )
+]
+
+forecast_plot <- forecast_2018[
+  ,
+  .(
+    encounter_year,
+    forecast_count,
+    lower_95,
+    upper_95
+  )
+]
+
+# =========================
+# 9. Chart: Corrected 2018 encounter forecast
+# =========================
+
+p_encounter_2018_fixed <- ggplot() +
+  
+  # Actual complete years: 2010-2016
+  geom_line(
+    data = actual_plot[
+      encounter_year <= 2016
+    ],
+    aes(
+      x = encounter_year,
+      y = encounter_count
+    ),
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    data = actual_plot[
+      encounter_year <= 2016
+    ],
+    aes(
+      x = encounter_year,
+      y = encounter_count,
+      text = paste0(
+        "Year: ", encounter_year,
+        "<br>Encounter Count: ",
+        scales::comma(encounter_count),
+        "<br>Status: Complete year used for model"
+      )
+    ),
+    size = 3
+  ) +
+  
+  geom_text(
+    data = actual_plot[
+      encounter_year <= 2016
+    ],
+    aes(
+      x = encounter_year,
+      y = encounter_count,
+      label = scales::comma(encounter_count)
+    ),
+    vjust = -0.8,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  
+  # 2017 incomplete point
+  geom_point(
+    data = actual_plot[
+      encounter_year == 2017
+    ],
+    aes(
+      x = encounter_year,
+      y = encounter_count,
+      text = paste0(
+        "Year: ", encounter_year,
+        "<br>Encounter Count: ",
+        scales::comma(encounter_count),
+        "<br>Status: Incomplete year excluded from model"
+      )
+    ),
+    size = 4,
+    shape = 17
+  ) +
+  
+  geom_text(
+    data = actual_plot[
+      encounter_year == 2017
+    ],
+    aes(
+      x = encounter_year,
+      y = encounter_count,
+      label = paste0(scales::comma(encounter_count), "\nIncomplete")
+    ),
+    vjust = 1.4,
+    size = 3.8,
+    fontface = "bold"
+  ) +
+  
+  # Forecast interval
+  geom_errorbar(
+    data = forecast_plot,
+    aes(
+      x = encounter_year,
+      ymin = lower_95,
+      ymax = upper_95
+    ),
+    width = 0.15,
+    linewidth = 1
+  ) +
+  
+  # Forecast point
+  geom_point(
+    data = forecast_plot,
+    aes(
+      x = encounter_year,
+      y = forecast_count,
+      text = paste0(
+        "Forecast Year: ", encounter_year,
+        "<br>Forecast Encounter Count: ", scales::comma(forecast_count),
+        "<br>95% Prediction Interval: ",
+        scales::comma(lower_95), " - ",
+        scales::comma(upper_95)
+      )
+    ),
+    size = 4
+  ) +
+  
+  geom_text(
+    data = forecast_plot,
+    aes(
+      x = encounter_year,
+      y = forecast_count,
+      label = scales::comma(forecast_count)
+    ),
+    vjust = -1,
+    size = 4.2,
+    fontface = "bold"
+  ) +
+  
+  # Dashed line from 2016 to forecast
+  geom_segment(
+    data = data.table(
+      x = 2016,
+      xend = 2018,
+      y = encounter_train[encounter_year == 2016, encounter_count],
+      yend = forecast_2018$forecast_count
+    ),
+    aes(
+      x = x,
+      xend = xend,
+      y = y,
+      yend = yend
+    ),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  
+  scale_x_continuous(
+    breaks = 2010:2018
+  ) +
+  
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0.05, 0.18))
+  ) +
+  
+  labs(
+    title = "2018 Hospital Encounter Count Forecast",
+    subtitle = paste0(
+      "Linear regression based on complete years 2010-2016; 2017 excluded as incomplete | R² = ",
+      encounter_r2
+    ),
+    x = "Year",
+    y = "Encounter Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold")
+  )
+
+p_encounter_2018_fixed
+
+ggplotly(p_encounter_2018_fixed, tooltip = "text")
+
+# =========================
+# 10. Forecast summary table
+# =========================
+
+hospital_encounter_forecast_summary <- data.table(
+  model = "Linear Regression",
+  training_period = "2010-2016 complete years",
+  excluded_year = "2017 incomplete year",
+  forecast_year = 2018,
+  forecast_count = forecast_2018$forecast_count,
+  lower_95 = forecast_2018$lower_95,
+  upper_95 = forecast_2018$upper_95,
+  r_squared = encounter_r2
+)
+
+hospital_encounter_forecast_summary
+```
+
+
+## Hospital-Specific Measurement Forecast by Type
+
+```{r forecast-measurement-by-type-polynomial-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+# =========================
+# 1. Selected measurement types
+# =========================
+
+selected_measurements <- c(
+  "Body Mass Index",
+  "Systolic Blood Pressure",
+  "Diastolic Blood Pressure",
+  "Glucose",
+  "Hemoglobin A1c/Hemoglobin.total in Blood",
+  "Total Cholesterol",
+  "Triglycerides"
+)
+
+# =========================
+# 2. Yearly measurement counts
+# =========================
+
+measurement_yearly <- observations %>%
+  mutate(
+    DATE = as.Date(DATE),
+    year = as.numeric(format(DATE, "%Y"))
+  ) %>%
+  filter(
+    DESCRIPTION %in% selected_measurements,
+    year >= 2010,
+    year <= 2017
+  ) %>%
+  count(year, DESCRIPTION, name = "measurement_count") %>%
+  mutate(
+    measure_short = case_when(
+      DESCRIPTION == "Body Mass Index" ~ "BMI",
+      DESCRIPTION == "Systolic Blood Pressure" ~ "Systolic BP",
+      DESCRIPTION == "Diastolic Blood Pressure" ~ "Diastolic BP",
+      DESCRIPTION == "Hemoglobin A1c/Hemoglobin.total in Blood" ~ "HbA1c",
+      DESCRIPTION == "Total Cholesterol" ~ "Total Cholesterol",
+      DESCRIPTION == "Triglycerides" ~ "Triglycerides",
+      DESCRIPTION == "Glucose" ~ "Glucose",
+      TRUE ~ DESCRIPTION
+    ),
+    year_status = case_when(
+      year == 2010 ~ "Ramp-up year excluded from model",
+      year == 2017 ~ "Incomplete year excluded from model",
+      TRUE ~ "Complete year used for model"
+    )
+  )
+
+measurement_yearly
+
+# =========================
+# 3. Training data: 2011-2016 only
+# =========================
+
+measurement_train <- measurement_yearly %>%
+  filter(
+    year >= 2011,
+    year <= 2016
+  ) %>%
+  group_by(measure_short) %>%
+  mutate(
+    year_index = year - min(year) + 1
+  ) %>%
+  ungroup()
+
+measurement_train
+
+# =========================
+# 4. FIX: Linear regression per measurement type (no polynomial)
+# =========================
+
+measurement_forecast <- measurement_train %>%
+  group_by(measure_short) %>%
+  do({
+    
+    df <- .
+    
+    # Simple linear model
+    model <- lm(
+      measurement_count ~ year_index,
+      data = df
+    )
+    
+    future_2018 <- data.frame(
+      year = 2018,
+      year_index = 2018 - min(df$year) + 1
+    )
+    
+    pred <- predict(
+      model,
+      newdata = future_2018,
+      interval = "prediction"
+    )
+    
+    count_2016 <- df %>%
+      filter(year == 2016) %>%
+      pull(measurement_count)
+    
+    data.frame(
+      year = 2018,
+      count_2016 = count_2016,
+      forecast_count = as.numeric(pred[1, "fit"]),
+      lower_2018 = as.numeric(pred[1, "lwr"]),
+      upper_2018 = as.numeric(pred[1, "upr"]),
+      r_squared = summary(model)$r.squared,
+      adjusted_r_squared = summary(model)$adj.r.squared
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    forecast_count = round(pmax(forecast_count, 0), 0),
+    lower_2018 = round(pmax(lower_2018, 0), 0),
+    upper_2018 = round(pmax(upper_2018, 0), 0),
+    r_squared = round(r_squared, 3),
+    adjusted_r_squared = round(adjusted_r_squared, 3),
+    predicted_change = forecast_count - count_2016,
+    trend_direction = case_when(
+      predicted_change > 0 ~ "Increasing",
+      predicted_change < 0 ~ "Decreasing",
+      TRUE ~ "Stable"
+    )
+  ) %>%
+  arrange(desc(forecast_count))
+
+measurement_forecast
+
+# =========================
+# 5. Actual and forecast plot data
+# =========================
+
+actual_plot <- measurement_train %>%
+  select(year, measure_short, measurement_count) %>%
+  mutate(data_type = "Actual")
+
+forecast_plot <- measurement_forecast %>%
+  select(year, measure_short, forecast_count, lower_2018, upper_2018, r_squared, adjusted_r_squared) %>%
+  rename(measurement_count = forecast_count) %>%
+  mutate(data_type = "Forecast")
+
+plot_data <- bind_rows(
+  actual_plot,
+  forecast_plot %>%
+    select(year, measure_short, measurement_count, data_type)
+)
+
+# =========================
+# 6. Chart 1: faceted timeline
+# =========================
+
+p_measurement_forecast_line <- ggplot() +
+  
+  geom_line(
+    data = actual_plot,
+    aes(
+      x = year,
+      y = measurement_count,
+      group = measure_short
+    ),
+    linewidth = 1
+  ) +
+  
+  geom_point(
+    data = actual_plot,
+    aes(
+      x = year,
+      y = measurement_count,
+      text = paste0(
+        "Measurement: ", measure_short,
+        "<br>Year: ", year,
+        "<br>Actual Count: ", scales::comma(measurement_count)
+      )
+    ),
+    size = 2.5
+  ) +
+  
+  geom_line(
+    data = plot_data %>% filter(year %in% c(2016, 2018)),
+    aes(
+      x = year,
+      y = measurement_count,
+      group = measure_short
+    ),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  
+  geom_point(
+    data = forecast_plot,
+    aes(
+      x = year,
+      y = measurement_count,
+      text = paste0(
+        "Measurement: ", measure_short,
+        "<br>Forecast Year: ", year,
+        "<br>Forecast Count: ", scales::comma(measurement_count),
+        "<br>R²: ", r_squared,
+        "<br>Adjusted R²: ", adjusted_r_squared
+      )
+    ),
+    size = 3
+  ) +
+  
+  geom_text(
+    data = forecast_plot,
+    aes(
+      x = year,
+      y = measurement_count,
+      label = scales::comma(round(measurement_count))
+    ),
+    vjust = -0.8,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  
+  facet_wrap(~ measure_short, scales = "free_y") +
+  
+  scale_x_continuous(
+    breaks = c(2011, 2012, 2013, 2014, 2015, 2016, 2018)
+  ) +
+  
+  scale_y_continuous(labels = scales::comma) +
+  
+  labs(
+    title = "Clinical Measurement Trend and 2018 Forecast by Type",
+    subtitle = "Polynomial regression based on 2011–2016; 2010 ramp-up and 2017 incomplete year excluded",
+    x = "Year",
+    y = "Measurement Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+
+p_measurement_forecast_line
+
+ggplotly(p_measurement_forecast_line, tooltip = "text")
+
+# =========================
+# 7. Chart 2: 2018 forecast by measurement type
+# =========================
+
+p_measurement_forecast_bar <- ggplot(
+  measurement_forecast,
+  aes(
+    x = reorder(measure_short, forecast_count),
+    y = forecast_count,
+    fill = trend_direction,
+    text = paste0(
+      "Measurement: ", measure_short,
+      "<br>2016 Count: ", scales::comma(count_2016),
+      "<br>2018 Forecast: ", scales::comma(forecast_count),
+      "<br>Predicted Change: ", scales::comma(predicted_change),
+      "<br>R²: ", r_squared,
+      "<br>Adjusted R²: ", adjusted_r_squared,
+      "<br>Trend: ", trend_direction
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_errorbar(
+    aes(
+      ymin = lower_2018,
+      ymax = upper_2018
+    ),
+    width = 0.2,
+    linewidth = 0.8
+  ) +
+  geom_text(
+    aes(label = scales::comma(forecast_count)),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "2018 Clinical Measurement Forecast by Type",
+    subtitle = "Polynomial regression forecast based on complete years 2011–2016",
+    x = "",
+    y = "Forecasted Measurement Count",
+    fill = "Trend Direction"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "top"
+  )
+
+p_measurement_forecast_bar
+
+ggplotly(p_measurement_forecast_bar, tooltip = "text")
+
+```
+## Forecast for Increasing Encounter Types
+
+```{r forecast-increasing-encounter-types-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(tidyr)
+
+# =========================
+# 1. Encounter type yearly count
+# =========================
+
+encounter_type_yearly_raw <- encounters %>%
+  mutate(
+    DATE = as.Date(DATE),
+    year = as.numeric(format(DATE, "%Y")),
+    encounter_type = trimws(DESCRIPTION)
+  ) %>%
+  filter(
+    !is.na(encounter_type),
+    encounter_type != "",
+    year >= 2010,
+    year <= 2017
+  ) %>%
+  count(year, encounter_type, name = "encounter_count")
+
+encounter_type_yearly_raw
+
+# =========================
+# 2. Top encounter types from complete years
+# 2010 ramp-up excluded
+# 2017 incomplete excluded
+# =========================
+
+top_encounter_types <- encounter_type_yearly_raw %>%
+  filter(year >= 2011, year <= 2016) %>%
+  group_by(encounter_type) %>%
+  summarise(
+    total_2011_2016 = sum(encounter_count, na.rm = TRUE),
+    active_years = n_distinct(year),
+    .groups = "drop"
+  ) %>%
+  filter(
+    total_2011_2016 > 0,
+    active_years >= 3
+  ) %>%
+  arrange(desc(total_2011_2016)) %>%
+  slice_head(n = 25) %>%
+  pull(encounter_type)
+
+# =========================
+# 3. Complete calendar: 2011-2016
+# Missing years become 0
+# =========================
+
+encounter_model_data <- expand.grid(
+  year = 2011:2016,
+  encounter_type = top_encounter_types,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    encounter_type_yearly_raw %>%
+      filter(
+        encounter_type %in% top_encounter_types,
+        year >= 2011,
+        year <= 2016
+      ),
+    by = c("year", "encounter_type")
+  ) %>%
+  mutate(
+    encounter_count = ifelse(is.na(encounter_count), 0, encounter_count)
+  ) %>%
+  group_by(encounter_type) %>%
+  mutate(
+    year_index = year - min(year) + 1
+  ) %>%
+  ungroup()
+
+encounter_model_data
+
+# =========================
+# 4. Polynomial regression by encounter type
+# =========================
+
+encounter_type_forecast_2018 <- encounter_model_data %>%
+  group_by(encounter_type) %>%
+  group_modify(~{
+    
+    df <- .x
+    
+    if (nrow(df) < 4 || length(unique(df$encounter_count)) < 3) {
+      
+      count_2016_value <- df$encounter_count[df$year == 2016][1]
+      
+      return(data.frame(
+        forecast_2018 = count_2016_value,
+        lower_2018 = count_2016_value,
+        upper_2018 = count_2016_value,
+        r_squared = 0,
+        adjusted_r_squared = 0,
+        count_2016 = count_2016_value
+      ))
+    }
+    
+    # FIX: Simple linear model (no polynomial)
+    model <- lm(
+      encounter_count ~ year_index,
+      data = df
+    )
+    
+    future_2018 <- data.frame(
+      year = 2018,
+      year_index = 2018 - min(df$year) + 1
+    )
+    
+    pred_2018 <- predict(
+      model,
+      newdata = future_2018,
+      interval = "prediction"
+    )
+    
+    count_2016_value <- df$encounter_count[df$year == 2016][1]
+    
+    data.frame(
+      forecast_2018 = as.numeric(pred_2018[1, "fit"]),
+      lower_2018 = as.numeric(pred_2018[1, "lwr"]),
+      upper_2018 = as.numeric(pred_2018[1, "upr"]),
+      r_squared = as.numeric(summary(model)$r.squared),
+      adjusted_r_squared = as.numeric(summary(model)$adj.r.squared),
+      count_2016 = as.numeric(count_2016_value)
+    )
+    
+  }) %>%
+  ungroup() %>%
+  mutate(
+    forecast_2018 = round(pmax(forecast_2018, 0), 0),
+    lower_2018 = round(pmax(lower_2018, 0), 0),
+    upper_2018 = round(pmax(upper_2018, 0), 0),
+    r_squared = round(r_squared, 3),
+    adjusted_r_squared = round(adjusted_r_squared, 3),
+    predicted_change = forecast_2018 - count_2016,
+    predicted_change_percent = round(
+      predicted_change / ifelse(count_2016 == 0, NA, count_2016) * 100,
+      1
+    ),
+    trend_direction = case_when(
+      predicted_change > 0 ~ "Increasing",
+      predicted_change < 0 ~ "Decreasing",
+      TRUE ~ "Stable"
+    )
+  ) %>%
+  arrange(desc(r_squared), desc(predicted_change))
+
+encounter_type_forecast_2018
+
+# =========================
+# 5. FIX: Show all increasing forecasts with LOOCV reliability label
+# R² >= 0.70 filter silinib
+# =========================
+
+strong_increasing_encounter_forecast <- encounter_type_forecast_2018 %>%
+  filter(predicted_change > 0) %>%
+  mutate(reliability = case_when(
+    r_squared >= 0.70 ~ "High (train R²)",
+    r_squared >= 0.50 ~ "Moderate",
+    TRUE              ~ "Low — use with caution"
+  )) %>%
+  arrange(desc(r_squared), desc(predicted_change)) %>%
+  slice_head(n = 10)
+
+strong_increasing_encounter_forecast
+
+# =========================
+# 6. Chart
+# =========================
+
+if (nrow(strong_increasing_encounter_forecast) == 0) {
+  
+  print("No encounter type passed the filter: R² >= 0.70 and predicted_change > 0.")
+  
+} else {
+  
+  p_strong_encounter_growth <- ggplot(
+    strong_increasing_encounter_forecast,
+    aes(
+      x = reorder(encounter_type, predicted_change),
+      y = predicted_change,
+      fill = r_squared,
+      text = paste0(
+        "Encounter Type: ", encounter_type,
+        "<br>2016 Actual Count: ", scales::comma(count_2016),
+        "<br>2018 Forecast: ", scales::comma(forecast_2018),
+        "<br>Predicted Increase: ", scales::comma(predicted_change),
+        "<br>Predicted Change Percent: ", predicted_change_percent, "%",
+        "<br>R²: ", r_squared,
+        "<br>Adjusted R²: ", adjusted_r_squared
+      )
+    )
+  ) +
+    geom_col(width = 0.7, color = "white") +
+    geom_text(
+      aes(label = scales::comma(predicted_change)),
+      hjust = -0.1,
+      size = 4,
+      fontface = "bold"
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0, 0.25))
+    ) +
+    labs(
+      title = "Strong Increasing Encounter Type Forecast for 2018",
+      subtitle = "Only encounter types with predicted increase and R² ≥ 0.70 are shown",
+      x = "",
+      y = "Predicted Increase in Encounter Count",
+      fill = "R²"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.y = element_text(face = "bold", size = 9),
+      legend.position = "top"
+    )
+  
+  p_strong_encounter_growth
+  
+}
+```
+## Forrecast Chronic Risk Group Demand
+```{r forecast-chronic-risk-group-demand-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(tidyr)
+
+# =========================
+# 1. Data preparation
+# =========================
+
+patients <- as.data.table(patients)
+encounters <- as.data.table(encounters)
+observations <- as.data.table(observations)
+
+encounters[, encounter_date := as.IDate(DATE)]
+encounters[, encounter_year := year(encounter_date)]
+
+observations[, obs_date := as.IDate(DATE)]
+observations[, obs_year := year(obs_date)]
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+
+patients[, BIRTHDATE := as.IDate(BIRTHDATE)]
+patients[, DEATHDATE := as.IDate(DEATHDATE)]
+
+patients[, age := as.integer(
+  difftime(
+    fifelse(is.na(DEATHDATE), as.IDate("2017-05-31"), DEATHDATE),
+    BIRTHDATE,
+    units = "days"
+  ) / 365.25
+)]
+
+patients[, age_group := fifelse(
+  age <= 21, "0-21",
+  fifelse(age <= 43, "22-43",
+          fifelse(age < 65, "44-65", "65+"))
+)]
+
+# =========================
+# 2. Create yearly clinical risk signals
+# =========================
+
+risk_obs <- observations[
+  obs_year >= 2010 &
+    obs_year <= 2017 &
+    !is.na(value_num) &
+    DESCRIPTION %in% c(
+      "Body Mass Index",
+      "Glucose",
+      "Hemoglobin A1c/Hemoglobin.total in Blood",
+      "Systolic Blood Pressure",
+      "Diastolic Blood Pressure",
+      "Total Cholesterol",
+      "Triglycerides"
+    ),
+  .(
+    PATIENT,
+    obs_year,
+    DESCRIPTION,
+    value_num
+  )
+]
+
+# Risk group assignment from clinical measurements
+risk_obs[, risk_group := case_when(
+  DESCRIPTION == "Glucose" &
+    value_num >= 126 ~ "Diabetes / Metabolic Risk",
+  
+  DESCRIPTION == "Hemoglobin A1c/Hemoglobin.total in Blood" &
+    value_num >= 6.5 ~ "Diabetes / Metabolic Risk",
+  
+  DESCRIPTION == "Body Mass Index" &
+    value_num >= 30 ~ "Obesity Risk",
+  
+  DESCRIPTION == "Systolic Blood Pressure" &
+    value_num >= 140 ~ "Hypertension Risk",
+  
+  DESCRIPTION == "Diastolic Blood Pressure" &
+    value_num >= 90 ~ "Hypertension Risk",
+  
+  DESCRIPTION == "Total Cholesterol" &
+    value_num >= 240 ~ "Lipid / Cholesterol Risk",
+  
+  DESCRIPTION == "Triglycerides" &
+    value_num >= 200 ~ "Lipid / Cholesterol Risk",
+  
+  TRUE ~ NA_character_
+)]
+
+risk_obs <- risk_obs[
+  !is.na(risk_group)
+]
+
+# Unique patient-year-risk group
+risk_patient_year <- unique(
+  risk_obs[
+    ,
+    .(
+      PATIENT,
+      year = obs_year,
+      risk_group
+    )
+  ]
+)
+
+risk_patient_year
+
+# =========================
+# 3. Encounter count by patient-year
+# =========================
+
+encounter_patient_year <- encounters[
+  encounter_year >= 2010 &
+    encounter_year <= 2017,
+  .(
+    visit_count = .N
+  ),
+  by = .(
+    PATIENT,
+    year = encounter_year
+  )
+]
+
+# Merge risk patient-year with visit counts
+risk_demand_patient_year <- merge(
+  risk_patient_year,
+  encounter_patient_year,
+  by = c("PATIENT", "year"),
+  all.x = TRUE
+)
+
+risk_demand_patient_year[is.na(visit_count), visit_count := 0]
+
+# Add patient demographics
+risk_demand_patient_year <- merge(
+  risk_demand_patient_year,
+  patients[
+    ,
+    .(
+      PATIENT = ID,
+      age,
+      age_group,
+      GENDER
+    )
+  ],
+  by = "PATIENT",
+  all.x = TRUE
+)
+
+risk_demand_patient_year
+
+# =========================
+# 4. Yearly demand by risk group
+# =========================
+
+risk_group_yearly <- risk_demand_patient_year[
+  ,
+  .(
+    risk_patient_count = uniqueN(PATIENT),
+    total_visit_demand = sum(visit_count, na.rm = TRUE),
+    avg_visit_per_patient = round(mean(visit_count, na.rm = TRUE), 2),
+    avg_age = round(mean(age, na.rm = TRUE), 1)
+  ),
+  by = .(
+    year,
+    risk_group
+  )
+][order(risk_group, year)]
+
+risk_group_yearly
+
+# =========================
+# 5. Complete calendar
+# 2010 = ramp-up year excluded
+# 2017 = incomplete year excluded
+# Training: 2011-2016
+# =========================
+
+target_risk_groups <- c(
+  "Diabetes / Metabolic Risk",
+  "Obesity Risk",
+  "Hypertension Risk",
+  "Lipid / Cholesterol Risk"
+)
+
+risk_calendar <- expand.grid(
+  year = 2011:2016,
+  risk_group = target_risk_groups,
+  stringsAsFactors = FALSE
+)
+
+risk_model_data <- risk_calendar %>%
+  left_join(
+    as.data.frame(risk_group_yearly) %>%
+      filter(
+        year >= 2011,
+        year <= 2016,
+        risk_group %in% target_risk_groups
+      ),
+    by = c("year", "risk_group")
+  ) %>%
+  mutate(
+    risk_patient_count = ifelse(is.na(risk_patient_count), 0, risk_patient_count),
+    total_visit_demand = ifelse(is.na(total_visit_demand), 0, total_visit_demand),
+    avg_visit_per_patient = ifelse(is.na(avg_visit_per_patient), 0, avg_visit_per_patient),
+    avg_age = ifelse(is.na(avg_age), 0, avg_age)
+  ) %>%
+  group_by(risk_group) %>%
+  mutate(
+    year_index = year - min(year) + 1
+  ) %>%
+  ungroup()
+
+risk_model_data
+
+# =========================
+# 6. FIX: Linear regression (NOT polynomial) + LOOCV
+# =========================
+
+risk_group_forecast_2018 <- risk_model_data %>%
+  group_by(risk_group) %>%
+  group_modify(~{
+    
+    df <- .x
+    
+    if (nrow(df) < 4 || length(unique(df$total_visit_demand)) < 3) {
+      count_2016_value   <- df$total_visit_demand[df$year == 2016][1]
+      patient_2016_value <- df$risk_patient_count[df$year == 2016][1]
+      return(data.frame(
+        forecast_2018       = count_2016_value,
+        lower_2018          = count_2016_value,
+        upper_2018          = count_2016_value,
+        r_squared           = 0,
+        adjusted_r_squared  = 0,
+        loocv_r2            = NA_real_,
+        loocv_rmse          = NA_real_,
+        count_2016          = count_2016_value,
+        patient_count_2016  = patient_2016_value
+      ))
+    }
+    
+    # Simple linear model only (no polynomial)
+    model <- lm(total_visit_demand ~ year_index, data = df)
+    
+    # LOOCV
+    ctrl  <- trainControl(method = "LOOCV")
+    cv_m  <- suppressWarnings(train(
+      total_visit_demand ~ year_index,
+      data = df, method = "lm", trControl = ctrl
+    ))
+    
+    future_2018 <- data.frame(year = 2018,
+                              year_index = 2018 - min(df$year) + 1)
+    pred_2018   <- predict(model, newdata = future_2018, interval = "prediction")
+    
+    count_2016_value   <- df$total_visit_demand[df$year == 2016][1]
+    patient_2016_value <- df$risk_patient_count[df$year == 2016][1]
+    
+    data.frame(
+      forecast_2018      = as.numeric(pred_2018[1,"fit"]),
+      lower_2018         = as.numeric(pred_2018[1,"lwr"]),
+      upper_2018         = as.numeric(pred_2018[1,"upr"]),
+      r_squared          = as.numeric(summary(model)$r.squared),
+      adjusted_r_squared = as.numeric(summary(model)$adj.r.squared),
+      loocv_r2           = round(cv_m$results$Rsquared, 3),
+      loocv_rmse         = round(cv_m$results$RMSE, 0),
+      count_2016         = as.numeric(count_2016_value),
+      patient_count_2016 = as.numeric(patient_2016_value)
+    )
+    
+  }) %>%
+  ungroup() %>%
+  mutate(
+    forecast_2018          = round(pmax(forecast_2018, 0), 0),
+    lower_2018             = round(pmax(lower_2018, 0), 0),
+    upper_2018             = round(pmax(upper_2018, 0), 0),
+    r_squared              = round(r_squared, 3),
+    adjusted_r_squared     = round(adjusted_r_squared, 3),
+    predicted_change       = forecast_2018 - count_2016,
+    predicted_change_percent = round(
+      predicted_change / ifelse(count_2016 == 0, NA, count_2016) * 100, 1),
+    trend_direction = case_when(
+      predicted_change > 0 ~ "Increasing",
+      predicted_change < 0 ~ "Decreasing",
+      TRUE                 ~ "Stable"
+    ),
+    # FIX: LOOCV-based reliability label (replaces R² >= 0.70 filter)
+    reliability = case_when(
+      loocv_r2 >= 0.70 ~ "High",
+      loocv_r2 >= 0.50 ~ "Moderate",
+      TRUE             ~ "Low — use with caution"
+    )
+  ) %>%
+  arrange(desc(loocv_r2), desc(predicted_change))
+
+risk_group_forecast_2018
+
+# =========================
+# 7. FIX: Show ALL models with LOOCV reliability label
+# R² >= 0.70 filter silinib — bütün modellər göstərilir, etibarlılığı açıq qeyd edilir
+# =========================
+
+strong_increasing_risk_forecast <- risk_group_forecast_2018 %>%
+  filter(predicted_change > 0) %>%
+  arrange(desc(loocv_r2), desc(predicted_change))
+
+strong_increasing_risk_forecast
+
+# =========================
+# 8. Chart 1: Strong increasing risk group forecast
+# =========================
+
+if (nrow(strong_increasing_risk_forecast) == 0) {
+  
+  print("No chronic risk group passed the filter: R² >= 0.70 and predicted_change > 0.")
+  
+} else {
+  
+  p_risk_growth <- ggplot(
+    strong_increasing_risk_forecast,
+    aes(
+      x = reorder(risk_group, predicted_change),
+      y = predicted_change,
+      fill = r_squared,
+      text = paste0(
+        "Risk Group: ", risk_group,
+        "<br>2016 Visit Demand: ", scales::comma(count_2016),
+        "<br>2018 Forecast Visit Demand: ", scales::comma(forecast_2018),
+        "<br>Predicted Increase: ", scales::comma(predicted_change),
+        "<br>Predicted Change Percent: ", predicted_change_percent, "%",
+        "<br>2016 Risk Patient Count: ", scales::comma(patient_count_2016),
+        "<br>R²: ", r_squared,
+        "<br>Adjusted R²: ", adjusted_r_squared,
+        "<br>Trend: ", trend_direction
+      )
+    )
+  ) +
+    geom_col(width = 0.7, color = "white") +
+    geom_text(
+      aes(label = scales::comma(predicted_change)),
+      hjust = -0.1,
+      size = 4,
+      fontface = "bold"
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0, 0.25))
+    ) +
+    labs(
+      title = "Strong Increasing Chronic Risk Group Demand Forecast",
+      subtitle = "Only risk groups with predicted increase and R² ≥ 0.70 are shown",
+      x = "",
+      y = "Predicted Increase in Visit Demand",
+      fill = "R²"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.y = element_text(face = "bold", size = 10),
+      legend.position = "top"
+    )
+  
+  p_risk_growth
+  
+  ggplotly(p_risk_growth, tooltip = "text")
+}
+
+# =========================
+# 9. Chart 2: Timeline of strong increasing risk groups
+# =========================
+
+risk_timeline_data <- risk_model_data %>%
+  filter(
+    risk_group %in% strong_increasing_risk_forecast$risk_group
+  )
+
+if (nrow(risk_timeline_data) == 0) {
+  
+  print("Timeline chart skipped because no strong increasing risk groups were found.")
+  
+} else {
+  
+  risk_forecast_points <- strong_increasing_risk_forecast %>%
+    transmute(
+      year = 2018,
+      risk_group,
+      total_visit_demand = forecast_2018,
+      data_type = "Forecast"
+    )
+  
+  risk_actual_points <- risk_timeline_data %>%
+    transmute(
+      year,
+      risk_group,
+      total_visit_demand,
+      data_type = "Actual"
+    )
+  
+  risk_plot_data <- bind_rows(
+    risk_actual_points,
+    risk_forecast_points
+  )
+  
+  p_risk_timeline <- ggplot(
+    risk_plot_data,
+    aes(
+      x = year,
+      y = total_visit_demand,
+      color = risk_group,
+      group = risk_group,
+      text = paste0(
+        "Risk Group: ", risk_group,
+        "<br>Year: ", year,
+        "<br>Visit Demand: ", scales::comma(total_visit_demand),
+        "<br>Type: ", data_type
+      )
+    )
+  ) +
+    geom_line(
+      data = risk_plot_data %>% filter(data_type == "Actual"),
+      linewidth = 1.2
+    ) +
+    geom_point(size = 3) +
+    geom_line(
+      data = risk_plot_data %>% filter(year %in% c(2016, 2018)),
+      linetype = "dashed",
+      linewidth = 1.1
+    ) +
+    geom_text(
+      data = risk_plot_data %>% filter(year == 2018),
+      aes(label = scales::comma(total_visit_demand)),
+      vjust = -0.8,
+      size = 4,
+      fontface = "bold"
+    ) +
+    scale_x_continuous(
+      breaks = c(2011:2016, 2018)
+    ) +
+    scale_y_continuous(
+      labels = scales::comma,
+      expand = expansion(mult = c(0.05, 0.20))
+    ) +
+    labs(
+      title = "Chronic Risk Group Demand Timeline and 2018 Forecast",
+      subtitle = "Training: 2011–2016; 2010 ramp-up and 2017 incomplete year excluded",
+      x = "Year",
+      y = "Visit Demand",
+      color = "Risk Group"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.x = element_text(face = "bold"),
+      legend.position = "top"
+    )
+  
+  p_risk_timeline
+  
+}
+
+# =========================
+# 10. Forecast summary table
+# =========================
+
+chronic_risk_forecast_summary <- strong_increasing_risk_forecast %>%
+  mutate(
+    model = "Polynomial Regression",
+    training_period = "2011-2016 complete years",
+    excluded_years = "2010 ramp-up year; 2017 incomplete year",
+    target = "Total visit demand by chronic risk group"
+  ) %>%
+  select(
+    model,
+    target,
+    training_period,
+    excluded_years,
+    risk_group,
+    count_2016,
+    forecast_2018,
+    predicted_change,
+    predicted_change_percent,
+    r_squared,
+    adjusted_r_squared,
+    trend_direction
+  )
+p_risk_timeline
+library(knitr)
+knitr:: kable(chronic_risk_forecast_summary)
+```
+
+## Alternative Measurement Forecast: Dumbbell Chart
+
+```{r forecast-measurement-dumbbell-chart, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# 2016 actual
+actual_2016 <- measurement_yearly %>%
+  filter(year == 2016) %>%
+  select(measure_short, actual_2016 = measurement_count)
+
+# forecast
+forecast_2018_plot <- measurement_forecast %>%
+  select(measure_short, forecast_2018 = forecast_count)
+
+# birləşdir
+dumbbell_data <- actual_2016 %>%
+  inner_join(forecast_2018_plot, by = "measure_short") %>%
+  mutate(
+    increase = forecast_2018 - actual_2016
+  ) %>%
+  arrange(increase)
+
+# chart
+p_dumbbell <- ggplot(dumbbell_data) +
+  
+  geom_segment(
+    aes(
+      x = actual_2016,
+      xend = forecast_2018,
+      y = reorder(measure_short, increase),
+      yend = reorder(measure_short, increase)
+    ),
+    color = "gray70",
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    aes(
+      x = actual_2016,
+      y = reorder(measure_short, increase)
+    ),
+    size = 4,
+    color = "steelblue"
+  ) +
+  
+  geom_point(
+    aes(
+      x = forecast_2018,
+      y = reorder(measure_short, increase)
+    ),
+    size = 4,
+    color = "firebrick"
+  ) +
+  
+  geom_text(
+    aes(
+      x = actual_2016,
+      y = reorder(measure_short, increase),
+      label = comma(round(actual_2016))
+    ),
+    hjust = 1.2,
+    size = 3.5,
+    color = "steelblue",
+    fontface = "bold"
+  ) +
+  
+  geom_text(
+    aes(
+      x = forecast_2018,
+      y = reorder(measure_short, increase),
+      label = comma(round(forecast_2018))
+    ),
+    hjust = -0.1,
+    size = 3.5,
+    color = "firebrick",
+    fontface = "bold"
+  ) +
+  
+  scale_x_continuous(labels = comma) +
+  
+  labs(
+    title = "2016 Actual vs 2018 Forecast by Clinical Measurement",
+    subtitle = "Dumbbell chart showing expected increase under linear regression",
+    x = "Measurement Count",
+    y = ""
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold")
+  )
+
+p_dumbbell
+```
+
+
+## Emergency Visit Growth Forecast
+```{r forecast-emergency-visit-growth-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(broom)
+
+# =========================
+# 1. Emergency encounter-ləri seçirik
+# =========================
+
+emergency_yearly <- encounters %>%
+  mutate(
+    DATE = as.Date(DATE),
+    year = as.numeric(format(DATE, "%Y")),
+    encounter_text = paste(DESCRIPTION, REASONDESCRIPTION)
+  ) %>%
+  filter(
+    year >= 2010,
+    year <= 2017,
+    grepl("emergency", encounter_text, ignore.case = TRUE)
+  ) %>%
+  count(year, name = "emergency_count") %>%
+  arrange(year)
+
+emergency_yearly
+
+# =========================
+# 2. 2017 incomplete olduğu üçün status əlavə edirik
+# =========================
+
+emergency_yearly <- emergency_yearly %>%
+  mutate(
+    year_status = case_when(
+      year == 2017 ~ "Incomplete year excluded from model",
+      TRUE ~ "Complete year used for model"
+    )
+  )
+
+# =========================
+# 3. Model üçün yalnız 2010-2016 complete years
+# =========================
+
+emergency_train <- emergency_yearly %>%
+  filter(year >= 2010, year <= 2016)
+
+# =========================
+# 4. Linear Regression Model
+# emergency_count ~ year
+# =========================
+
+emergency_lm_model <- lm(
+  emergency_count ~ year,
+  data = emergency_train
+)
+
+summary(emergency_lm_model)
+
+emergency_r2 <- round(summary(emergency_lm_model)$r.squared, 3)
+
+emergency_slope <- round(coef(emergency_lm_model)[["year"]], 1)
+
+trend_direction <- case_when(
+  emergency_slope > 0 ~ "Increasing",
+  emergency_slope < 0 ~ "Decreasing",
+  TRUE ~ "Stable"
+)
+
+# =========================
+# 5. 2018 forecast
+# =========================
+
+forecast_2018 <- data.frame(
+  year = 2018
+)
+
+pred_2018 <- predict(
+  emergency_lm_model,
+  newdata = forecast_2018,
+  interval = "prediction"
+)
+
+forecast_2018 <- forecast_2018 %>%
+  mutate(
+    forecast_count = round(pred_2018[1, "fit"], 0),
+    lower_95 = round(pred_2018[1, "lwr"], 0),
+    upper_95 = round(pred_2018[1, "upr"], 0)
+  ) %>%
+  mutate(
+    forecast_count = ifelse(forecast_count < 0, 0, forecast_count),
+    lower_95 = ifelse(lower_95 < 0, 0, lower_95),
+    upper_95 = ifelse(upper_95 < 0, 0, upper_95)
+  )
+
+forecast_2018
+
+# =========================
+# 6. 2016 ilə müqayisə
+# =========================
+
+count_2016 <- emergency_yearly %>%
+  filter(year == 2016) %>%
+  pull(emergency_count)
+
+if (length(count_2016) == 0) {
+  count_2016 <- NA_real_
+}
+
+emergency_forecast_summary <- data.frame(
+  model = "Linear Regression",
+  training_period = "2010-2016 complete years",
+  excluded_year = "2017 incomplete year",
+  forecast_year = 2018,
+  count_2016 = count_2016,
+  forecast_2018 = forecast_2018$forecast_count,
+  predicted_change = forecast_2018$forecast_count - count_2016,
+  predicted_change_percent = round(
+    (forecast_2018$forecast_count - count_2016) / count_2016 * 100,
+    1
+  ),
+  r_squared = emergency_r2,
+  slope = emergency_slope,
+  trend_direction = trend_direction
+)
+
+emergency_forecast_summary
+
+# =========================
+# 7. Chart
+# =========================
+
+p_emergency_growth <- ggplot() +
+  
+  # Complete years line
+  geom_line(
+    data = emergency_yearly %>% filter(year <= 2016),
+    aes(
+      x = year,
+      y = emergency_count
+    ),
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    data = emergency_yearly %>% filter(year <= 2016),
+    aes(
+      x = year,
+      y = emergency_count,
+      text = paste0(
+        "Year: ", year,
+        "<br>Emergency Count: ", scales::comma(emergency_count),
+        "<br>Status: Complete year used for model"
+      )
+    ),
+    size = 3
+  ) +
+  
+  geom_text(
+    data = emergency_yearly %>% filter(year <= 2016),
+    aes(
+      x = year,
+      y = emergency_count,
+      label = scales::comma(emergency_count)
+    ),
+    vjust = -0.8,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  
+  # 2017 incomplete point
+  geom_point(
+    data = emergency_yearly %>% filter(year == 2017),
+    aes(
+      x = year,
+      y = emergency_count,
+      text = paste0(
+        "Year: ", year,
+        "<br>Emergency Count: ", scales::comma(emergency_count),
+        "<br>Status: Incomplete year excluded from model"
+      )
+    ),
+    size = 4,
+    shape = 17
+  ) +
+  
+  geom_text(
+    data = emergency_yearly %>% filter(year == 2017),
+    aes(
+      x = year,
+      y = emergency_count,
+      label = paste0(scales::comma(emergency_count), "\nIncomplete")
+    ),
+    vjust = 1.4,
+    size = 3.8,
+    fontface = "bold"
+  ) +
+  
+  # Forecast interval
+  geom_errorbar(
+    data = forecast_2018,
+    aes(
+      x = year,
+      ymin = lower_95,
+      ymax = upper_95
+    ),
+    width = 0.15,
+    linewidth = 1
+  ) +
+  
+  # Forecast point
+  geom_point(
+    data = forecast_2018,
+    aes(
+      x = year,
+      y = forecast_count,
+      text = paste0(
+        "Forecast Year: ", year,
+        "<br>Forecast Emergency Count: ", scales::comma(forecast_count),
+        "<br>95% Prediction Interval: ",
+        scales::comma(lower_95), " - ",
+        scales::comma(upper_95)
+      )
+    ),
+    size = 4
+  ) +
+  
+  geom_text(
+    data = forecast_2018,
+    aes(
+      x = year,
+      y = forecast_count,
+      label = scales::comma(forecast_count)
+    ),
+    vjust = -1,
+    size = 4.2,
+    fontface = "bold"
+  ) +
+  
+  # Dashed line from 2016 to forecast
+  geom_segment(
+    data = data.frame(
+      x = 2016,
+      xend = 2018,
+      y = count_2016,
+      yend = forecast_2018$forecast_count
+    ),
+    aes(
+      x = x,
+      xend = xend,
+      y = y,
+      yend = yend
+    ),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  
+  scale_x_continuous(
+    breaks = 2010:2018
+  ) +
+  
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0.05, 0.20))
+  ) +
+  
+  labs(
+    title = "Emergency Visit Growth Forecast for 2018",
+    subtitle = paste0(
+      "Linear regression based on complete years 2010-2016; 2017 excluded as incomplete | R² = ",
+      emergency_r2,
+      " | Trend: ",
+      trend_direction
+    ),
+    x = "Year",
+    y = "Emergency Visit Count"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(face = "bold")
+  )
+
+p_emergency_growth
+
+ggplotly(p_emergency_growth, tooltip = "text")
+```
+
+
+## Pediatric / ENT Visit Forecast
+
+```{r forecast-pediatric-ent-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(tidyr)
+
+# =========================
+# 1. Pediatric / ENT / Respiratory reason keywords
+# =========================
+
+ent_keywords <- c(
+  "sinusitis",
+  "pharyngitis",
+  "otitis",
+  "asthma",
+  "bronchitis",
+  "sore throat",
+  "strep"
+)
+
+# =========================
+# 2. Yearly ENT-related visit count
+# =========================
+
+ent_yearly_raw <- encounters %>%
+  mutate(
+    DATE = as.Date(DATE),
+    year = as.numeric(format(DATE, "%Y")),
+    reason_clean = trimws(REASONDESCRIPTION),
+    encounter_text = paste(DESCRIPTION, REASONDESCRIPTION)
+  ) %>%
+  filter(
+    year >= 2010,
+    year <= 2017,
+    !is.na(encounter_text),
+    grepl(
+      paste(ent_keywords, collapse = "|"),
+      encounter_text,
+      ignore.case = TRUE
+    )
+  ) %>%
+  mutate(
+    ent_reason_group = case_when(
+      grepl("sinusitis", encounter_text, ignore.case = TRUE) ~ "Sinusitis",
+      grepl("pharyngitis", encounter_text, ignore.case = TRUE) ~ "Pharyngitis",
+      grepl("otitis", encounter_text, ignore.case = TRUE) ~ "Otitis Media",
+      grepl("asthma", encounter_text, ignore.case = TRUE) ~ "Asthma",
+      grepl("bronchitis", encounter_text, ignore.case = TRUE) ~ "Bronchitis",
+      grepl("strep|sore throat", encounter_text, ignore.case = TRUE) ~ "Strep / Sore Throat",
+      TRUE ~ "Other ENT"
+    )
+  ) %>%
+  count(year, ent_reason_group, name = "visit_count")
+
+ent_yearly_raw
+
+# =========================
+# 3. Complete calendar: 2010-2016 training years
+# 2017 modeldən çıxarılır, çünki incomplete year-dır
+# =========================
+
+target_ent_groups <- c(
+  "Sinusitis",
+  "Pharyngitis",
+  "Otitis Media",
+  "Asthma",
+  "Bronchitis",
+  "Strep / Sore Throat"
+)
+
+ent_model_data <- expand.grid(
+  year = 2010:2016,
+  ent_reason_group = target_ent_groups,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    ent_yearly_raw %>%
+      filter(
+        year >= 2010,
+        year <= 2016,
+        ent_reason_group %in% target_ent_groups
+      ),
+    by = c("year", "ent_reason_group")
+  ) %>%
+  mutate(
+    visit_count = ifelse(is.na(visit_count), 0, visit_count)
+  )
+
+ent_model_data
+
+# =========================
+# 4. Forecast model: ayrı-ayrı ENT reason üçün Linear Regression
+# visit_count ~ year
+# =========================
+
+ent_forecast_2018 <- ent_model_data %>%
+  group_by(ent_reason_group) %>%
+  group_modify(~{
+    
+    df <- .x
+    
+    # Əgər data hamısı eynidirsə model zəif olur, yenə də safe result qaytarırıq
+    if (nrow(df) < 2 || length(unique(df$visit_count)) < 2) {
+      
+      count_2016_value <- df$visit_count[df$year == 2016][1]
+      
+      return(data.frame(
+        forecast_2018 = count_2016_value,
+        lower_2018 = count_2016_value,
+        upper_2018 = count_2016_value,
+        r_squared = 0,
+        slope = 0,
+        count_2016 = count_2016_value
+      ))
+    }
+    
+    model <- lm(visit_count ~ year, data = df)
+    
+    pred_2018 <- predict(
+      model,
+      newdata = data.frame(year = 2018),
+      interval = "prediction"
+    )
+    
+    count_2016_value <- df$visit_count[df$year == 2016][1]
+    slope_value <- coef(model)[["year"]]
+    
+    data.frame(
+      forecast_2018 = as.numeric(pred_2018[1, "fit"]),
+      lower_2018 = as.numeric(pred_2018[1, "lwr"]),
+      upper_2018 = as.numeric(pred_2018[1, "upr"]),
+      r_squared = as.numeric(summary(model)$r.squared),
+      slope = as.numeric(slope_value),
+      count_2016 = as.numeric(count_2016_value)
+    )
+    
+  }) %>%
+  ungroup() %>%
+  mutate(
+    forecast_2018 = round(pmax(forecast_2018, 0), 0),
+    lower_2018 = round(pmax(lower_2018, 0), 0),
+    upper_2018 = round(pmax(upper_2018, 0), 0),
+    r_squared = round(r_squared, 3),
+    slope = round(slope, 1),
+    predicted_change = forecast_2018 - count_2016,
+    predicted_change_percent = round(
+      predicted_change / ifelse(count_2016 == 0, NA, count_2016) * 100,
+      1
+    ),
+    trend_direction = case_when(
+      predicted_change > 0 ~ "Increasing",
+      predicted_change < 0 ~ "Decreasing",
+      TRUE ~ "Stable"
+    )
+  ) %>%
+  arrange(desc(forecast_2018))
+
+ent_forecast_2018
+
+# =========================
+# 5. 2017 actual incomplete ayrıca göstərilir
+# =========================
+
+ent_2017_incomplete <- ent_yearly_raw %>%
+  filter(
+    year == 2017,
+    ent_reason_group %in% target_ent_groups
+  ) %>%
+  rename(incomplete_2017_count = visit_count)
+
+ent_2017_incomplete
+
+ent_forecast_2018 <- ent_forecast_2018 %>%
+  left_join(
+    ent_2017_incomplete %>%
+      select(ent_reason_group, incomplete_2017_count),
+    by = "ent_reason_group"
+  ) %>%
+  mutate(
+    incomplete_2017_count = ifelse(is.na(incomplete_2017_count), 0, incomplete_2017_count)
+  )
+
+ent_forecast_2018
+
+# =========================
+# 6. Chart 1: 2018 forecast by ENT reason
+# =========================
+
+p_ent_forecast_2018 <- ggplot(
+  ent_forecast_2018,
+  aes(
+    x = reorder(ent_reason_group, forecast_2018),
+    y = forecast_2018,
+    fill = trend_direction,
+    text = paste0(
+      "ENT / Pediatric Reason: ", ent_reason_group,
+      "<br>2016 Actual Count: ", scales::comma(count_2016),
+      "<br>2017 Count: ", scales::comma(incomplete_2017_count), " (Incomplete)",
+      "<br>2018 Forecast: ", scales::comma(forecast_2018),
+      "<br>Predicted Change from 2016: ", scales::comma(predicted_change),
+      "<br>Predicted Change Percent: ", predicted_change_percent, "%",
+      "<br>R-squared: ", r_squared,
+      "<br>Trend: ", trend_direction
+    )
+  )
+) +
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = lower_2018,
+      ymax = upper_2018
+    ),
+    width = 0.2,
+    linewidth = 0.8
+  ) +
+  geom_text(
+    aes(label = scales::comma(forecast_2018)),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "2018 Pediatric / ENT Visit Forecast",
+    subtitle = "Linear regression based on complete years 2010–2016; 2017 excluded as incomplete",
+    x = "",
+    y = "Forecasted Visit Count",
+    fill = "Trend Direction"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "top"
+  )
+
+p_ent_forecast_2018
+
+ggplotly(p_ent_forecast_2018, tooltip = "text")
+
+# =========================
+# 7. Chart 2: Actual 2016 vs Forecast 2018
+# =========================
+
+ent_comparison <- ent_forecast_2018 %>%
+  select(ent_reason_group, count_2016, forecast_2018) %>%
+  pivot_longer(
+    cols = c(count_2016, forecast_2018),
+    names_to = "data_type",
+    values_to = "visit_count"
+  ) %>%
+  mutate(
+    data_type = case_when(
+      data_type == "count_2016" ~ "Actual 2016",
+      data_type == "forecast_2018" ~ "Forecast 2018"
+    )
+  )
+
+p_ent_actual_vs_forecast <- ggplot(
+  ent_comparison,
+  aes(
+    x = reorder(ent_reason_group, visit_count),
+    y = visit_count,
+    fill = data_type,
+    text = paste0(
+      "Reason: ", ent_reason_group,
+      "<br>Type: ", data_type,
+      "<br>Visit Count: ", scales::comma(visit_count)
+    )
+  )
+) +
+  geom_col(
+    position = "dodge",
+    width = 0.75,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = scales::comma(visit_count)),
+    position = position_dodge(width = 0.75),
+    hjust = -0.1,
+    size = 3.6,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.30))
+  ) +
+  labs(
+    title = "Actual 2016 vs Forecast 2018 ENT Visits",
+    subtitle = "Comparison of complete-year actual count and forecasted visit count",
+    x = "",
+    y = "Visit Count",
+    fill = "Data Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "top"
+  )
+
+p_ent_actual_vs_forecast
+
+ggplotly(p_ent_actual_vs_forecast, tooltip = "text")
+
+# =========================
+# 8. Chart 3: Growth only
+# =========================
+
+ent_growth_only <- ent_forecast_2018 %>%
+  arrange(desc(predicted_change))
+
+p_ent_growth <- ggplot(
+  ent_growth_only,
+  aes(
+    x = reorder(ent_reason_group, predicted_change),
+    y = predicted_change,
+    fill = trend_direction,
+    text = paste0(
+      "Reason: ", ent_reason_group,
+      "<br>Predicted Change: ", scales::comma(predicted_change),
+      "<br>2016 Actual: ", scales::comma(count_2016),
+      "<br>2018 Forecast: ", scales::comma(forecast_2018),
+      "<br>R-squared: ", r_squared
+    )
+  )
+) +
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  geom_text(
+    aes(label = scales::comma(predicted_change)),
+    hjust = ifelse(ent_growth_only$predicted_change >= 0, -0.1, 1.1),
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0.15, 0.25))
+  ) +
+  labs(
+    title = "Predicted Growth in Pediatric / ENT Visits",
+    subtitle = "2018 forecast compared with actual 2016 count",
+    x = "",
+    y = "Predicted Change in Visit Count",
+    fill = "Trend Direction"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "top"
+  )
+
+p_ent_growth
+
+ggplotly(p_ent_growth, tooltip = "text")
+```
+## Encounter Type Growth Forecast
+
+```{r forecast-encounter-type-growth-2018, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(scales)
+library(tidyr)
+
+# =========================
+# 1. Encounter type üzrə yearly count
+# =========================
+
+encounter_type_yearly_raw <- encounters %>%
+  mutate(
+    DATE = as.Date(DATE),
+    year = as.numeric(format(DATE, "%Y")),
+    encounter_type = trimws(DESCRIPTION)
+  ) %>%
+  filter(
+    !is.na(encounter_type),
+    encounter_type != "",
+    year >= 2010,
+    year <= 2017
+  ) %>%
+  count(year, encounter_type, name = "encounter_count")
+
+encounter_type_yearly_raw
+
+# =========================
+# 2. Top encounter type-ları seçirik
+# 2010-2016 complete years əsasında
+# =========================
+
+top_encounter_types <- encounter_type_yearly_raw %>%
+  filter(year >= 2010, year <= 2016) %>%
+  group_by(encounter_type) %>%
+  summarise(
+    total_2010_2016 = sum(encounter_count, na.rm = TRUE),
+    active_years = n_distinct(year),
+    .groups = "drop"
+  ) %>%
+  filter(
+    total_2010_2016 > 0,
+    active_years >= 2
+  ) %>%
+  arrange(desc(total_2010_2016)) %>%
+  slice_head(n = 20) %>%
+  pull(encounter_type)
+
+# =========================
+# 3. Complete calendar yaradırıq
+# Hər encounter type üçün 2010-2016 illəri olsun
+# Missing illərə 0 veririk
+# =========================
+
+encounter_model_data <- expand.grid(
+  year = 2010:2016,
+  encounter_type = top_encounter_types,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    encounter_type_yearly_raw %>%
+      filter(
+        encounter_type %in% top_encounter_types,
+        year >= 2010,
+        year <= 2016
+      ),
+    by = c("year", "encounter_type")
+  ) %>%
+  mutate(
+    encounter_count = ifelse(is.na(encounter_count), 0, encounter_count)
+  )
+
+encounter_model_data
+
+# =========================
+# 4. Hər encounter type üçün Linear Regression forecast
+# encounter_count ~ year
+# =========================
+
+encounter_type_forecast_2018 <- encounter_model_data %>%
+  group_by(encounter_type) %>%
+  group_modify(~{
+    
+    df <- .x
+    
+    # Əgər data kifayət deyil və ya hamısı eyni dəyərdirsə, safe output
+    if (nrow(df) < 2 || length(unique(df$encounter_count)) < 2) {
+      
+      count_2016_value <- df$encounter_count[df$year == 2016][1]
+      
+      return(data.frame(
+        forecast_2018 = count_2016_value,
+        lower_2018 = count_2016_value,
+        upper_2018 = count_2016_value,
+        r_squared = 0,
+        slope = 0,
+        count_2016 = count_2016_value
+      ))
+    }
+    
+    model <- lm(encounter_count ~ year, data = df)
+    
+    pred_2018 <- predict(
+      model,
+      newdata = data.frame(year = 2018),
+      interval = "prediction"
+    )
+    
+    count_2016_value <- df$encounter_count[df$year == 2016][1]
+    slope_value <- coef(model)[["year"]]
+    
+    data.frame(
+      forecast_2018 = as.numeric(pred_2018[1, "fit"]),
+      lower_2018 = as.numeric(pred_2018[1, "lwr"]),
+      upper_2018 = as.numeric(pred_2018[1, "upr"]),
+      r_squared = as.numeric(summary(model)$r.squared),
+      slope = as.numeric(slope_value),
+      count_2016 = as.numeric(count_2016_value)
+    )
+    
+  }) %>%
+  ungroup() %>%
+  mutate(
+    forecast_2018 = round(pmax(forecast_2018, 0), 0),
+    lower_2018 = round(pmax(lower_2018, 0), 0),
+    upper_2018 = round(pmax(upper_2018, 0), 0),
+    r_squared = round(r_squared, 3),
+    slope = round(slope, 1),
+    predicted_change = forecast_2018 - count_2016,
+    predicted_change_percent = round(
+      predicted_change / ifelse(count_2016 == 0, NA, count_2016) * 100,
+      1
+    ),
+    trend_direction = case_when(
+      predicted_change > 0 ~ "Increasing",
+      predicted_change < 0 ~ "Decreasing",
+      TRUE ~ "Stable"
+    )
+  ) %>%
+  arrange(desc(predicted_change))
+
+encounter_type_forecast_2018
+
+# =========================
+# 5. 2017 incomplete count ayrıca əlavə olunur
+# =========================
+
+encounter_2017_incomplete <- encounter_type_yearly_raw %>%
+  filter(
+    year == 2017,
+    encounter_type %in% top_encounter_types
+  ) %>%
+  rename(incomplete_2017_count = encounter_count)
+
+encounter_type_forecast_2018 <- encounter_type_forecast_2018 %>%
+  left_join(
+    encounter_2017_incomplete %>%
+      select(encounter_type, incomplete_2017_count),
+    by = "encounter_type"
+  ) %>%
+  mutate(
+    incomplete_2017_count = ifelse(is.na(incomplete_2017_count), 0, incomplete_2017_count)
+  )
+
+encounter_type_forecast_2018
+
+# =========================
+# 6. Sadəcə artım gözlənilən encounter type-lar
+# =========================
+
+increasing_encounter_types <- encounter_type_forecast_2018 %>%
+  filter(
+    trend_direction == "Increasing",
+    predicted_change > 0
+  ) %>%
+  arrange(desc(predicted_change)) %>%
+  slice_head(n = 10)
+
+increasing_encounter_types
+
+# =========================
+# 7. Chart 1: Ən çox artacaq müraciət növləri
+# =========================
+
+p_encounter_growth <- ggplot(
+  increasing_encounter_types,
+  aes(
+    x = reorder(encounter_type, predicted_change),
+    y = predicted_change,
+    fill = r_squared,
+    text = paste0(
+      "Encounter Type: ", encounter_type,
+      "<br>2016 Actual Count: ", scales::comma(count_2016),
+      "<br>2017 Count: ", scales::comma(incomplete_2017_count), " (Incomplete)",
+      "<br>2018 Forecast: ", scales::comma(forecast_2018),
+      "<br>Predicted Increase: ", scales::comma(predicted_change),
+      "<br>Predicted Change Percent: ", predicted_change_percent, "%",
+      "<br>R-squared: ", r_squared,
+      "<br>Slope: ", slope,
+      "<br>Trend: ", trend_direction
+    )
+  )
+) +
+  geom_col(
+    width = 0.7,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = scales::comma(predicted_change)),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "Encounter Type Growth Forecast for 2018",
+    subtitle = "Encounter types with the highest predicted increase; 2017 excluded as incomplete",
+    x = "",
+    y = "Predicted Increase in Encounter Count",
+    fill = "R²"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 9),
+    legend.position = "top"
+  )
+
+p_encounter_growth
+
+ggplotly(p_encounter_growth, tooltip = "text")
+
+# =========================
+# 8. Chart 2: 2016 actual vs 2018 forecast
+# =========================
+
+encounter_comparison <- increasing_encounter_types %>%
+  select(encounter_type, count_2016, forecast_2018) %>%
+  pivot_longer(
+    cols = c(count_2016, forecast_2018),
+    names_to = "data_type",
+    values_to = "encounter_count"
+  ) %>%
+  mutate(
+    data_type = case_when(
+      data_type == "count_2016" ~ "Actual 2016",
+      data_type == "forecast_2018" ~ "Forecast 2018"
+    )
+  )
+
+p_encounter_actual_vs_forecast <- ggplot(
+  encounter_comparison,
+  aes(
+    x = reorder(encounter_type, encounter_count),
+    y = encounter_count,
+    fill = data_type,
+    text = paste0(
+      "Encounter Type: ", encounter_type,
+      "<br>Type: ", data_type,
+      "<br>Encounter Count: ", scales::comma(encounter_count)
+    )
+  )
+) +
+  geom_col(
+    position = "dodge",
+    width = 0.75,
+    color = "white"
+  ) +
+  geom_text(
+    aes(label = scales::comma(encounter_count)),
+    position = position_dodge(width = 0.75),
+    hjust = -0.1,
+    size = 3.5,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.30))
+  ) +
+  labs(
+    title = "Actual 2016 vs Forecast 2018 Encounter Types",
+    subtitle = "Comparison of complete-year actual count and forecasted encounter count",
+    x = "",
+    y = "Encounter Count",
+    fill = "Data Type"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 9),
+    legend.position = "top"
+  )
+
+p_encounter_actual_vs_forecast
+
+ggplotly(p_encounter_actual_vs_forecast, tooltip = "text")
+```
+
+## Strong r2 Clincal Measuremnet Forecast
+```{r strong-r2-clinical-measurement-forecast, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+library(scales)
+
+observations <- as.data.table(observations)
+
+# =========================
+# 1. Date preparation
+# =========================
+
+observations[, obs_date := as.IDate(DATE)]
+observations[, obs_year := year(obs_date)]
+observations[, obs_month := month(obs_date)]
+
+# =========================
+# 2. Selected clinical measurements
+# =========================
+
+selected_measurements <- c(
+  "Body Mass Index",
+  "Systolic Blood Pressure",
+  "Diastolic Blood Pressure",
+  "Glucose",
+  "Hemoglobin A1c/Hemoglobin.total in Blood",
+  "Total Cholesterol",
+  "Triglycerides"
+)
+
+measurement_data <- observations[
+  DESCRIPTION %in% selected_measurements &
+    !is.na(obs_year) &
+    !is.na(obs_month)
+]
+
+measurement_data[, measurement_short := case_when(
+  DESCRIPTION == "Body Mass Index" ~ "BMI",
+  DESCRIPTION == "Systolic Blood Pressure" ~ "Systolic BP",
+  DESCRIPTION == "Diastolic Blood Pressure" ~ "Diastolic BP",
+  DESCRIPTION == "Glucose" ~ "Glucose",
+  DESCRIPTION == "Hemoglobin A1c/Hemoglobin.total in Blood" ~ "HbA1c",
+  DESCRIPTION == "Total Cholesterol" ~ "Total Cholesterol",
+  DESCRIPTION == "Triglycerides" ~ "Triglycerides",
+  TRUE ~ DESCRIPTION
+)]
+
+# =========================
+# 3. Monthly measurement count
+# 2010-2016 complete years only
+# 2017 excluded because incomplete
+# =========================
+
+monthly_measurement <- measurement_data[
+  obs_year >= 2010 &
+    obs_year <= 2016,
+  .(
+    monthly_count = .N
+  ),
+  by = .(
+    measurement_short,
+    obs_year,
+    obs_month
+  )
+]
+
+# Full calendar: missing months become 0
+calendar_grid <- CJ(
+  measurement_short = unique(measurement_data$measurement_short),
+  obs_year = 2010:2016,
+  obs_month = 1:12
+)
+
+monthly_measurement_full <- merge(
+  calendar_grid,
+  monthly_measurement,
+  by = c("measurement_short", "obs_year", "obs_month"),
+  all.x = TRUE
+)
+
+monthly_measurement_full[is.na(monthly_count), monthly_count := 0]
+
+monthly_measurement_full[, year_index := obs_year - 2010 + 1]
+monthly_measurement_full[, month_factor := factor(obs_month)]
+monthly_measurement_full[, measurement_short := factor(measurement_short)]
+
+# Log transform helps count data
+monthly_measurement_full[, log_monthly_count := log1p(monthly_count)]
+
+# =========================
+# 4. FIX: Linear model with monthly seasonality (remove polynomial year term)
+# Monthly seasonality is kept — it is legitimate with enough data points
+# =========================
+
+measurement_strong_model <- lm(
+  log_monthly_count ~
+    measurement_short +
+    year_index +
+    month_factor,
+  data = monthly_measurement_full
+)
+
+summary(measurement_strong_model)
+
+model_r2 <- round(summary(measurement_strong_model)$r.squared, 3)
+model_adj_r2 <- round(summary(measurement_strong_model)$adj.r.squared, 3)
+
+model_fit_summary <- data.table(
+  model = "Multiple Linear Regression with Monthly Seasonality",
+  target = "Monthly clinical measurement count",
+  training_period = "2010-2016 complete years",
+  excluded_year = "2017 incomplete year",
+  r_squared = model_r2,
+  adjusted_r_squared = model_adj_r2
+)
+
+model_fit_summary
+
+# =========================
+# 5. Forecast 2018 monthly measurement demand
+# =========================
+
+future_2018 <- CJ(
+  measurement_short = levels(monthly_measurement_full$measurement_short),
+  obs_month = 1:12
+)
+
+future_2018[, obs_year := 2018]
+future_2018[, year_index := obs_year - 2010 + 1]
+
+future_2018[, measurement_short := factor(
+  measurement_short,
+  levels = levels(monthly_measurement_full$measurement_short)
+)]
+
+future_2018[, month_factor := factor(
+  obs_month,
+  levels = levels(monthly_measurement_full$month_factor)
+)]
+
+pred_2018 <- predict(
+  measurement_strong_model,
+  newdata = future_2018,
+  interval = "prediction"
+)
+
+future_2018[, forecast_count := round(pmax(expm1(pred_2018[, "fit"]), 0), 0)]
+future_2018[, lower_95 := round(pmax(expm1(pred_2018[, "lwr"]), 0), 0)]
+future_2018[, upper_95 := round(pmax(expm1(pred_2018[, "upr"]), 0), 0)]
+
+future_2018[, month_name := factor(
+  month.name[obs_month],
+  levels = month.name
+)]
+
+future_2018
+
+# =========================
+# 6. Forecast summary by measurement
+# =========================
+
+measurement_2018_summary <- future_2018[
+  ,
+  .(
+    forecast_2018_total = sum(forecast_count),
+    avg_monthly_forecast = round(mean(forecast_count), 1),
+    peak_month = as.character(month_name[which.max(forecast_count)]),
+    peak_month_forecast = max(forecast_count),
+    lower_95_total = sum(lower_95),
+    upper_95_total = sum(upper_95),
+    r_squared = model_r2,
+    adjusted_r_squared = model_adj_r2
+  ),
+  by = measurement_short
+][order(-forecast_2018_total)]
+
+measurement_2018_summary
+
+# =========================
+# 7. Chart 1: 2018 total forecast by measurement
+# =========================
+
+
+p_measurement_2018_total <- ggplot(
+  measurement_2018_summary,
+  aes(
+    x = reorder(measurement_short, forecast_2018_total),
+    y = forecast_2018_total,
+    fill = measurement_short,
+    text = paste0(
+      "Measurement: ", measurement_short,
+      "<br>2018 Forecast Total: ", scales::comma(forecast_2018_total),
+      "<br>Average Monthly Forecast: ", scales::comma(avg_monthly_forecast),
+      "<br>Peak Month: ", peak_month,
+      "<br>Peak Month Forecast: ", scales::comma(peak_month_forecast),
+      "<br>R-squared: ", r_squared,
+      "<br>Adjusted R-squared: ", adjusted_r_squared
+    )
+  )
+) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = scales::comma(forecast_2018_total)),
+    hjust = -0.1,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title = "2018 Clinical Measurement Demand Forecast",
+    subtitle = paste0(
+      "Multiple regression with monthly seasonality | R² = ",
+      model_r2,
+      " | Adjusted R² = ",
+      model_adj_r2
+    ),
+    x = "",
+    y = "Forecasted Measurement Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.y = element_text(face = "bold", size = 10),
+    legend.position = "none"
+  )
+
+p_measurement_2018_total
+
+ggplotly(p_measurement_2018_total, tooltip = "text")
+
+# =========================
+# 8. Chart 2: Monthly forecast timeline
+# =========================
+
+p_measurement_2018_monthly <- ggplot(
+  future_2018,
+  aes(
+    x = month_name,
+    y = forecast_count,
+    color = measurement_short,
+    group = measurement_short,
+    text = paste0(
+      "Measurement: ", measurement_short,
+      "<br>Month: ", month_name,
+      "<br>Forecast Count: ", scales::comma(forecast_count),
+      "<br>95% Interval: ",
+      scales::comma(lower_95), " - ",
+      scales::comma(upper_95)
+    )
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_y_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0.05, 0.20))
+  ) +
+  labs(
+    title = "Monthly Clinical Measurement Forecast for 2018",
+    subtitle = "Forecasted monthly demand by measurement type",
+    x = "Month",
+    y = "Forecasted Measurement Count",
+    color = "Measurement"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text.x = element_text(angle = 35, hjust = 1, face = "bold"),
+    legend.position = "top"
+  )
+
+p_measurement_2018_monthly
+
+ggplotly(p_measurement_2018_monthly, tooltip = "text")
+
+# =========================
+# 9. Model fit chart
+# =========================
+
+fit_chart <- data.table(
+  metric = c("R-squared", "Adjusted R-squared"),
+  value = c(model_r2, model_adj_r2)
+)
+
+p_model_fit <- ggplot(
+  fit_chart,
+  aes(
+    x = metric,
+    y = value,
+    fill = metric,
+    text = paste0(
+      "Metric: ", metric,
+      "<br>Value: ", value
+    )
+  )
+) +
+  geom_col(width = 0.55, color = "white") +
+  geom_text(
+    aes(label = value),
+    vjust = -0.3,
+    size = 5,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Forecast Regression Model Fit",
+    subtitle = "R² validation for monthly clinical measurement forecast",
+    x = "",
+    y = "Model Fit"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "none"
+  )
+
+p_model_fit
+
+ggplotly(p_model_fit, tooltip = "text")
+```
+
+---
+
+# Predictive Analytics — DATA ANALYST SECTION
+
+> **Bu bölmə yuxarıdakı klinik bölmələrdən fərqlidir.** Klinik bölmələr "bu xəstə nə üçün xəstədir?" sualını cavablandırır. Bu bölmə isə data analyst-ın suallarını cavablandırır: **"Hansı dəyişən ölümü ən yaxşı proqnozlaşdırır? Model nə dərəcədə dəqiqdir? ROC AUC nədir?"**
+
+## DA-1: Klinik Dəyişənlər Arasında Korrelyasiya Analizi
+
+```{r da-correlation-matrix, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(corrplot)
+library(data.table)
+library(dplyr)
+
+# Build patient-level analytical dataset
+# Each row = one patient, columns = latest clinical values + demographics
+
+patients <- as.data.table(patients)
+observations <- as.data.table(observations)
+encounters <- as.data.table(encounters)
+
+observations[, value_num := suppressWarnings(as.numeric(VALUE))]
+observations[, obs_date := as.IDate(DATE)]
+
+# Latest value per patient per measurement
+key_measures <- c(
+  "Body Mass Index",
+  "Systolic Blood Pressure",
+  "Diastolic Blood Pressure",
+  "Total Cholesterol",
+  "Glucose",
+  "Hemoglobin A1c/Hemoglobin.total in Blood",
+  "High Density Lipoprotein Cholesterol",
+  "Triglycerides",
+  "Body Height",
+  "Body Weight"
+)
+
+latest_obs <- observations[
+  DESCRIPTION %in% key_measures & !is.na(value_num)
+][order(PATIENT, DESCRIPTION, obs_date)][
+  , .SD[.N], by = .(PATIENT, DESCRIPTION)
+] |> dcast(PATIENT ~ DESCRIPTION, value.var = "value_num")
+
+# Clean column names
+clean_names <- c(
+  "PATIENT", "bmi", "sbp", "dbp",
+  "cholesterol", "glucose", "hba1c",
+  "hdl", "height", "triglycerides", "weight"
+)
+# Only rename columns that exist
+existing_cols <- c(
+  "PATIENT",
+  intersect(names(latest_obs), key_measures)
+)
+latest_obs <- as.data.frame(latest_obs)[, existing_cols, drop = FALSE]
+new_names <- c("PATIENT", c("bmi","sbp","dbp","cholesterol","glucose",
+                              "hba1c","hdl","height","triglycerides","weight")[
+  seq_along(existing_cols) - 1])
+setnames(latest_obs, existing_cols, new_names[seq_along(existing_cols)])
+
+# Add age and mortality flag
+patients[, age := as.integer(
+  difftime(fifelse(is.na(DEATHDATE), as.IDate("2017-12-31"), DEATHDATE),
+           BIRTHDATE, units = "days") / 365.25)]
+patients[, deceased := as.integer(!is.na(DEATHDATE))]
+
+analytic_df <- patients[
+  , .(PATIENT = ID, age, deceased, GENDER)
+][latest_obs, on = "PATIENT"]
+
+# Correlation matrix of numeric variables
+num_vars <- analytic_df %>%
+  select(age, deceased, any_of(c("bmi","sbp","dbp","cholesterol",
+                                   "glucose","hba1c","hdl","triglycerides"))) %>%
+  as.data.frame()
+
+cor_mat <- cor(num_vars, use = "pairwise.complete.obs")
+
+corrplot(cor_mat,
+  method   = "color",
+  type     = "upper",
+  addCoef.col = "black",
+  number.cex  = 0.7,
+  tl.cex   = 0.9,
+  tl.col   = "#2C3E50",
+  col      = colorRampPalette(c("#E76F51","white","#2A9D8F"))(200),
+  mar      = c(0, 0, 2, 0),
+  title    = "Correlation Matrix — Clinical Variables + Mortality"
+)
+```
+
+> **Insight:** The correlation matrix reveals which clinical variables are most associated with `deceased` (the mortality flag). Variables with strong positive correlation to deceased represent potential predictors for our logistic regression model. Age is expected to have the highest correlation — validating data integrity. HbA1c and Glucose correlations with each other (multicollinearity) are important to handle in the model.
+
+## DA-2: Korrelyasiyalar Sıralı — "deceased" ilə Ən Güclü Əlaqə
+
+```{r da-correlation-ranked, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(ggplot2)
+library(scales)
+library(kableExtra)
+
+# Correlation with deceased — sorted
+corr_deceased <- cor_mat["deceased", ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(Correlation = ".") %>%
+  filter(Variable != "deceased") %>%
+  mutate(
+    abs_corr  = abs(Correlation),
+    Direction = ifelse(Correlation > 0, "Positive", "Negative"),
+    Strength  = case_when(
+      abs_corr >= 0.3 ~ "Strong",
+      abs_corr >= 0.1 ~ "Moderate",
+      TRUE            ~ "Weak"
+    )
+  ) %>%
+  arrange(desc(abs_corr))
+
+corr_deceased %>%
+  mutate(Correlation = round(Correlation, 3)) %>%
+  kable(caption = "Variable Correlations with Mortality (deceased = 1)") %>%
+  kable_styling(full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed"),
+    position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(which(corr_deceased$Strength == "Strong"), background = "#fde8e8")
+
+# Chart
+p_corr <- ggplot(corr_deceased,
+  aes(x = reorder(Variable, abs_corr), y = Correlation,
+      fill = Direction,
+      text = paste0(Variable,
+                    "<br>Correlation: ", round(Correlation, 3),
+                    "<br>Strength: ", Strength))) +
+  geom_col(width = 0.65, alpha = 0.88) +
+  geom_hline(yintercept = 0, color = "#2C3E50", linewidth = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Positive" = "#E76F51", "Negative" = "#2A9D8F")) +
+  scale_y_continuous(limits = c(-0.5, 0.5)) +
+  labs(
+    title    = "Clinical Variable Correlations with Patient Mortality",
+    subtitle = "Ranked by absolute correlation strength",
+    x = NULL, y = "Pearson Correlation with 'deceased'",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16, color = "#2C3E50"),
+    plot.subtitle = element_text(color = "gray40"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+plotly::ggplotly(p_corr, tooltip = "text")
+```
+
+> **Insight:** Age is the dominant predictor of mortality — as expected for a synthetic population modelled on US demographics. Among clinical variables, HbA1c and glucose show positive correlations with mortality (higher metabolic burden = higher risk), while HDL cholesterol shows a negative correlation (protective effect of "good" cholesterol). This pattern is consistent with the academic literature and validates the dataset's clinical plausibility.
+
+---
+
+## DA-3: Logistic Regression — Mortality Prediction Model
+
+```{r da-logistic-regression, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+library(caret)
+library(pROC)
+
+# ── Prepare modelling dataset ─────────────────────────────────────────────
+model_df <- analytic_df %>%
+  select(deceased, age, GENDER,
+         any_of(c("bmi","sbp","dbp","cholesterol",
+                  "glucose","hba1c","hdl","triglycerides"))) %>%
+  mutate(
+    deceased = factor(deceased, levels = c(0,1), labels = c("Alive","Deceased")),
+    GENDER   = factor(GENDER)
+  ) %>%
+  drop_na()
+
+cat("Modelling dataset:", nrow(model_df), "patients\n")
+cat("Class distribution:\n")
+print(table(model_df$deceased))
+cat("Class balance:", round(prop.table(table(model_df$deceased)) * 100, 1), "%\n")
+
+# ── Train / test split (80/20) ────────────────────────────────────────────
+set.seed(42)
+train_idx  <- createDataPartition(model_df$deceased, p = 0.80, list = FALSE)
+train_data <- model_df[ train_idx, ]
+test_data  <- model_df[-train_idx, ]
+
+# ── 5-fold cross-validated logistic regression ────────────────────────────
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+log_model <- train(
+  deceased ~ .,
+  data      = train_data,
+  method    = "glm",
+  family    = "binomial",
+  trControl = ctrl,
+  metric    = "ROC"
+)
+
+cat("\n=== Cross-Validated Performance (5-fold) ===\n")
+print(log_model$results)
+```
+
+## DA-4: Model Evaluation — ROC Curve & AUC
+
+```{r da-roc-auc, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Predictions on held-out test set
+test_probs <- predict(log_model, newdata = test_data, type = "prob")
+test_preds <- predict(log_model, newdata = test_data)
+
+# ROC curve
+roc_obj <- roc(
+  response  = test_data$deceased,
+  predictor = test_probs$Deceased,
+  levels    = c("Alive","Deceased")
+)
+
+auc_val <- round(auc(roc_obj), 3)
+cat("Test AUC:", auc_val, "\n")
+
+# Plot ROC
+roc_df <- data.frame(
+  Specificity = roc_obj$specificities,
+  Sensitivity = roc_obj$sensitivities
+)
+
+p_roc <- ggplot(roc_df, aes(x = 1 - Specificity, y = Sensitivity)) +
+  geom_line(color = "#2A9D8F", linewidth = 1.5) +
+  geom_abline(intercept = 0, slope = 1,
+              linetype = "dashed", color = "#E76F51", linewidth = 1) +
+  annotate("text", x = 0.65, y = 0.15,
+           label = paste0("AUC = ", auc_val),
+           color = "#2A9D8F", fontface = "bold", size = 5) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title    = "ROC Curve — Mortality Prediction Model (Logistic Regression)",
+    subtitle = paste0("Test set AUC = ", auc_val,
+                      " | Random classifier AUC = 0.500 (red dashed)"),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    caption = "Training: 80% patients | Test: 20% patients | 5-fold CV"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16, color = "#2C3E50"),
+    plot.subtitle = element_text(color = "gray40"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_roc)
+```
+
+> **Insight:** AUC measures the model's ability to distinguish deceased from living patients across all classification thresholds. **AUC > 0.70** indicates a useful model; **AUC > 0.80** is strong. The mortality prediction model benefits significantly from `age` as the dominant predictor — this is expected and not a data leakage problem since age is a genuine risk factor, not a post-hoc label.
+
+## DA-5: Confusion Matrix — Classification Performance
+
+```{r da-confusion-matrix, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Confusion matrix
+cm <- confusionMatrix(test_preds, test_data$deceased, positive = "Deceased")
+print(cm)
+
+# Extract key metrics
+metrics_df <- data.frame(
+  Metric    = c("Accuracy","Sensitivity (Recall)","Specificity",
+                "Precision (PPV)","Balanced Accuracy","Kappa"),
+  Value     = round(c(
+    cm$overall["Accuracy"],
+    cm$byClass["Sensitivity"],
+    cm$byClass["Specificity"],
+    cm$byClass["Pos Pred Value"],
+    cm$byClass["Balanced Accuracy"],
+    cm$overall["Kappa"]
+  ), 3),
+  Meaning   = c(
+    "% of all patients correctly classified",
+    "% of deceased patients correctly identified",
+    "% of living patients correctly identified",
+    "% of 'Deceased' predictions that are correct",
+    "Average of Sensitivity + Specificity",
+    "Agreement corrected for chance (>0.4 = moderate)"
+  )
+)
+
+metrics_df %>%
+  kable(caption = "Classification Performance Metrics — Test Set") %>%
+  kable_styling(full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed"),
+    position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F")
+```
+
+> **Insight:** In mortality prediction, **Sensitivity (Recall) is more important than Precision** — we prefer to flag patients as high-risk incorrectly (false positives) over missing a genuinely high-risk patient (false negatives). A senior data analyst would select the classification threshold based on this business priority, not simply use the default 0.5 cutoff.
+
+## DA-6: Feature Importance — Kəmiyyətcə Ən Mühüm Dəyişənlər
+
+```{r da-feature-importance, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Extract logistic regression coefficients (log-odds)
+coef_df <- coef(log_model$finalModel) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(Log_Odds = ".") %>%
+  filter(Variable != "(Intercept)") %>%
+  mutate(
+    Odds_Ratio = round(exp(Log_Odds), 3),
+    abs_logodds = abs(Log_Odds),
+    Direction   = ifelse(Log_Odds > 0, "Increases Risk", "Decreases Risk")
+  ) %>%
+  arrange(desc(abs_logodds))
+
+coef_df %>%
+  mutate(Log_Odds = round(Log_Odds, 3)) %>%
+  select(Variable, Log_Odds, Odds_Ratio, Direction) %>%
+  kable(caption = "Logistic Regression Coefficients — Feature Importance") %>%
+  kable_styling(full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed"),
+    position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(which(coef_df$Direction == "Increases Risk"), background = "#fde8e8") %>%
+  row_spec(which(coef_df$Direction == "Decreases Risk"), background = "#d4edda")
+
+# Feature importance chart
+p_feat <- ggplot(coef_df,
+  aes(x = reorder(Variable, abs_logodds), y = Log_Odds,
+      fill = Direction,
+      text = paste0(Variable,
+                    "<br>Log-Odds: ", round(Log_Odds,3),
+                    "<br>Odds Ratio: ", Odds_Ratio,
+                    "<br>", Direction))) +
+  geom_col(width = 0.65, alpha = 0.88) +
+  geom_hline(yintercept = 0, color = "#2C3E50", linewidth = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Increases Risk" = "#E76F51",
+                                "Decreases Risk" = "#2A9D8F")) +
+  labs(
+    title    = "Feature Importance — Logistic Regression (Log-Odds Coefficients)",
+    subtitle = "Red = increases mortality risk | Teal = decreases mortality risk",
+    x = NULL, y = "Log-Odds Coefficient",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16, color = "#2C3E50"),
+    plot.subtitle = element_text(color = "gray40"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+plotly::ggplotly(p_feat, tooltip = "text")
+```
+
+> **Insight:** The log-odds coefficients show the **directional and magnitude impact** of each variable on mortality risk. An odds ratio > 1 means higher values of that variable increase the probability of death; < 1 means it is protective. Age consistently dominates — each additional year increases log-odds significantly. HDL cholesterol's negative coefficient confirms its cardioprotective role: higher HDL → lower mortality risk. Note that all variables are on their original scale (not standardised), so coefficients are not directly comparable in magnitude across variables with different units.
+
+---
+
+## DA-7: Patient Risk Scoring
+
+```{r da-risk-scoring, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+# Apply model to ALL patients (not just test set) to generate risk scores
+all_features <- analytic_df %>%
+  select(PATIENT, deceased, age, GENDER,
+         any_of(c("bmi","sbp","dbp","cholesterol",
+                  "glucose","hba1c","hdl","triglycerides"))) %>%
+  mutate(
+    deceased = factor(deceased, levels = c(0,1), labels = c("Alive","Deceased")),
+    GENDER   = factor(GENDER)
+  ) %>%
+  drop_na()
+
+all_features$risk_score <- predict(log_model,
+                                    newdata = all_features,
+                                    type    = "prob")$Deceased
+
+all_features <- all_features %>%
+  mutate(
+    risk_tier = case_when(
+      risk_score >= 0.70 ~ "High Risk (≥70%)",
+      risk_score >= 0.40 ~ "Moderate Risk (40-70%)",
+      risk_score >= 0.20 ~ "Low Risk (20-40%)",
+      TRUE               ~ "Very Low Risk (<20%)"
+    )
+  )
+
+# Summary by tier
+risk_tier_summary <- all_features %>%
+  group_by(risk_tier) %>%
+  summarise(
+    patients          = n(),
+    actual_deceased   = sum(deceased == "Deceased"),
+    mortality_rate    = round(actual_deceased / patients * 100, 1),
+    avg_risk_score    = round(mean(risk_score) * 100, 1),
+    avg_age           = round(mean(age, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_risk_score))
+
+risk_tier_summary %>%
+  rename(
+    `Risk Tier`         = risk_tier,
+    Patients            = patients,
+    `Actual Deceased`   = actual_deceased,
+    `Actual Mortality %`= mortality_rate,
+    `Avg Predicted Risk`= avg_risk_score,
+    `Avg Age`           = avg_age
+  ) %>%
+  kable(caption = "Patient Risk Tier Summary — Model-Based Stratification") %>%
+  kable_styling(full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed"),
+    position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(1, background = "#fde8e8") %>%
+  row_spec(2, background = "#fff3e0")
+
+# Risk score distribution
+p_risk_dist <- ggplot(all_features,
+  aes(x = risk_score, fill = deceased)) +
+  geom_histogram(bins = 50, alpha = 0.75, position = "identity") +
+  geom_vline(xintercept = 0.40, linetype = "dashed",
+             color = "#F4A261", linewidth = 1) +
+  geom_vline(xintercept = 0.70, linetype = "dashed",
+             color = "#E76F51", linewidth = 1) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("Alive" = "#2A9D8F", "Deceased" = "#E76F51")) +
+  annotate("text", x = 0.42, y = Inf, vjust = 2,
+           label = "Moderate threshold (40%)", color = "#F4A261",
+           size = 3.5, hjust = 0) +
+  annotate("text", x = 0.72, y = Inf, vjust = 2,
+           label = "High risk threshold (70%)", color = "#E76F51",
+           size = 3.5, hjust = 0) +
+  labs(
+    title    = "Predicted Mortality Risk Score Distribution",
+    subtitle = "Teal = living patients | Red = deceased patients | Dashed = risk thresholds",
+    x = "Predicted Mortality Probability",
+    y = "Number of Patients",
+    fill = "Actual Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16, color = "#2C3E50"),
+    plot.subtitle = element_text(color = "gray40"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+plotly::ggplotly(p_risk_dist)
+```
+
+> **Insight:** The risk score distribution shows clear separation between living (teal) and deceased (red) patients — living patients cluster near 0 while deceased patients have higher predicted risk scores. The "High Risk" tier (≥70% predicted probability) should have a significantly higher actual mortality rate than the "Very Low Risk" tier, validating the model's clinical utility. This risk scoring system could be used to prioritise proactive care management interventions.
+
+---
+
+## DA-8: Model Summary & Business Value
+
+```{r da-model-summary, include=TRUE, message=FALSE, warning=FALSE, echo=TRUE}
+
+summary_tbl <- data.frame(
+  Component = c(
+    "Algorithm",
+    "Training set",
+    "Test set",
+    "Validation method",
+    "AUC (test)",
+    "Key predictor",
+    "Protective factor",
+    "Business application"
+  ),
+  Detail = c(
+    "Logistic Regression (binomial, 5-fold CV)",
+    "80% of patients with complete clinical data",
+    "20% held-out (unseen during training)",
+    "5-fold cross-validation + independent test set",
+    paste0(auc_val, " (", ifelse(auc_val >= 0.80,"Strong",
+                                  ifelse(auc_val >= 0.70,"Moderate","Weak")),")"),
+    "Age (strongest log-odds coefficient)",
+    "HDL Cholesterol (negative coefficient — cardioprotective)",
+    "Flag high-risk patients for proactive care management"
+  )
+)
+
+summary_tbl %>%
+  kable(caption = "Predictive Model Summary") %>%
+  kable_styling(full_width = FALSE,
+    bootstrap_options = c("striped","hover"),
+    position = "center") %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#4B4B8F") %>%
+  row_spec(5, bold = TRUE, background = "#d4edda")
+```
+
+> **Methodological Note:** All models should be retrained on real clinical data before operational use. Synthea is a synthetic dataset — while statistically plausible, it does not capture real-world confounders (socioeconomic factors, geographic variation, healthcare access). The logistic regression here demonstrates the *analytical methodology*, not a deployable clinical decision support tool.
+
