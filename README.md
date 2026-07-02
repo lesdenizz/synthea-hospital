@@ -4,8 +4,6 @@ An end-to-end clinical data analytics project on the Synthea synthetic patient d
 
 The project demonstrates a complete data analytics pipeline: raw data → preparation → descriptive → diagnostic → predictive → actionable recommendations.
 
-🔗 **[Live R Markdown Report](https://019efee8-aa34-d788-9e95-d664d5e8b924.share.connect.posit.cloud/)**  
-🔗 **[Live Shiny Dashboard](#)** *(update after deployment)*
 
 ---
 
