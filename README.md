@@ -17,7 +17,7 @@ The project demonstrates a complete data analytics pipeline: raw data → prepar
 
 **Source:** [Synthea — Open-source Synthetic Patient Generator](https://synthea.mitre.org/downloads)  
 **Period:** 2010–2017 | 2017 is a partial year — excluded from all forecasting models
-
+LIVE SHINY - https://019f60f8-8f8c-6215-e6c4-8fd6a8d55349.share.connect.posit.cloud/
 ---
 
 ## R Markdown Report — Structure (6,919 lines)
